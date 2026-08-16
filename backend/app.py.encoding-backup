@@ -1,0 +1,2124 @@
+from __future__ import annotations
+import csv, io, json, os, re, sqlite3, zipfile, time, statistics, subprocess, sys
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, request, session, send_file, send_from_directory
+from flask_cors import CORS
+from dotenv import load_dotenv
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:
+    psycopg = None
+    dict_row = None
+from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+    from project_builder import UniversalProjectBuilder
+except Exception:
+    try:
+        from backend.project_builder import UniversalProjectBuilder
+    except Exception:
+        UniversalProjectBuilder = None
+
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+except Exception:
+    A4 = None
+    canvas = None
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "nexus.db"
+
+# Load .env BEFORE reading database/environment configuration.
+load_dotenv(BASE_DIR / ".env")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.startswith(("postgresql://", "postgres://", "postgresql+psycopg://"))
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+app = Flask(__name__, static_folder=str(FRONTEND_DIR), static_url_path="")
+APP_ENV = os.getenv("NEXUS_ENV", "development").lower()
+SECRET = os.getenv("NEXUS_SECRET_KEY", "")
+if APP_ENV == "production" and len(SECRET) < 32:
+    raise RuntimeError("NEXUS_SECRET_KEY must be set to a strong 32+ character value in production.")
+app.secret_key = SECRET or "dev-only-nexus-secret-change-me"
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=os.getenv("NEXUS_SECURE_COOKIE","0")=="1", MAX_CONTENT_LENGTH=1024*1024)
+CORS(app, supports_credentials=True, origins=[x.strip() for x in os.getenv("NEXUS_CORS_ORIGINS", "http://127.0.0.1:5000,http://localhost:5000").split(",") if x.strip()])
+
+DEMO_EMAIL = "demo@nexus-x.local"
+DEMO_PASSWORD = "demo123"
+DEMO_NAME = "Demo User"
+STATUSES = ["NOT STARTED", "IN PROGRESS", "BLOCKED", "COMPLETED"]
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+    if APP_ENV == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if request.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+_RATE_BUCKETS = {}
+
+def _rate_limit_disabled():
+    """Disable application rate limiting during automated pytest runs only."""
+    return (
+        app.testing
+        or os.getenv("NEXUS_TESTING") == "1"
+        or os.getenv("PYTEST_CURRENT_TEST") is not None
+        or "pytest" in sys.modules
+    )
+
+def rate_limit(limit=60, window=60):
+    def deco(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            # Automated tests must not be blocked by production abuse protection.
+            # Rate limiting remains fully active during normal application execution.
+            if _rate_limit_disabled():
+                return fn(*args, **kwargs)
+
+            key = (request.remote_addr or "unknown", request.endpoint or fn.__name__)
+            now_m = time.monotonic()
+            bucket = _RATE_BUCKETS.setdefault(key, [])
+            bucket[:] = [t for t in bucket if now_m - t < window]
+
+            if len(_RATE_BUCKETS) > 5000:
+                stale_cutoff = now_m - max(window, 300)
+                for k, vals in list(_RATE_BUCKETS.items()):
+                    vals[:] = [t for t in vals if t >= stale_cutoff]
+                    if not vals:
+                        _RATE_BUCKETS.pop(k, None)
+
+            if len(bucket) >= limit:
+                return jsonify({
+                    "error": "Too many requests. Please wait a moment and try again."
+                }), 429
+
+            bucket.append(now_m)
+            return fn(*args, **kwargs)
+
+        return wrapped
+    return deco
+
+
+class PGResult:
+    """Small compatibility layer so the existing NEXUS-X SQL stays usable on PostgreSQL."""
+    def __init__(self, cursor, lastrowid=None, buffered=None):
+        self.cursor = cursor
+        self.lastrowid = lastrowid
+        self._buffered = list(buffered or [])
+
+    def fetchone(self):
+        if self._buffered:
+            return self._buffered.pop(0)
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        if self._buffered:
+            rows = self._buffered[:]
+            self._buffered.clear()
+            return rows + self.cursor.fetchall()
+        return self.cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        """Expose DB-API rowcount for compatibility with SQLite-style route code."""
+        return self.cursor.rowcount
+
+    def __iter__(self):
+        if self._buffered:
+            rows = self._buffered[:]
+            self._buffered.clear()
+            yield from rows
+        yield from self.cursor
+
+
+class PGConnection:
+    def __init__(self, dsn):
+        if psycopg is None:
+            raise RuntimeError("PostgreSQL support requires psycopg[binary]. Install requirements.txt first.")
+        dsn = dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+        self.conn = psycopg.connect(dsn, row_factory=dict_row)
+
+    @staticmethod
+    def _sql(sql):
+        # Existing NEXUS-X queries use SQLite's qmark placeholders.
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=()):
+        q = self._sql(sql)
+        stripped = q.lstrip().upper()
+        is_insert = stripped.startswith("INSERT INTO") and "RETURNING" not in stripped
+        if is_insert:
+            q = q.rstrip().rstrip(";") + " RETURNING id"
+        try:
+            cur = self.conn.cursor()
+            cur.execute(q, params)
+            lastrowid = None
+            buffered = []
+            if is_insert:
+                row = cur.fetchone()
+                if row:
+                    lastrowid = row.get("id") if isinstance(row, dict) else row[0]
+            return PGResult(cur, lastrowid=lastrowid, buffered=buffered)
+        except Exception as exc:
+            # Keep existing route-level IntegrityError handling compatible.
+            if exc.__class__.__name__ in {"UniqueViolation", "ForeignKeyViolation", "CheckViolation"}:
+                raise sqlite3.IntegrityError(str(exc)) from exc
+            raise
+
+    def executescript(self, script):
+        for statement in [x.strip() for x in script.split(";") if x.strip()]:
+            self.execute(statement)
+        return None
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
+def _using_postgres():
+    """
+    Use PostgreSQL for normal application execution.
+    Automated tests intentionally use their isolated temporary SQLite DB.
+    This prevents tests from modifying the real development PostgreSQL database.
+    """
+    return USE_POSTGRES and not (
+        app.testing
+        or os.getenv("NEXUS_TESTING") == "1"
+        or os.getenv("PYTEST_CURRENT_TEST") is not None
+    )
+
+
+def ensure_column(c, table, column, definition):
+    if _using_postgres():
+        exists = c.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND column_name=?", (table, column)).fetchone()
+        if not exists:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    else:
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def db():
+    # Production/development -> PostgreSQL
+    # pytest -> isolated temporary SQLite database
+    if _using_postgres():
+        return PGConnection(DATABASE_URL)
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def rowdict(r):
+    return dict(r) if r else None
+
+
+def _postgres_schema(c):
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'TEAM MEMBER',plan TEXT NOT NULL DEFAULT 'FREE',created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS projects(id SERIAL PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL,deadline_days INTEGER NOT NULL DEFAULT 14,team_size INTEGER NOT NULL DEFAULT 3,budget DOUBLE PRECISION NOT NULL DEFAULT 0,infrastructure_cost DOUBLE PRECISION NOT NULL DEFAULT 0,ai_cost DOUBLE PRECISION NOT NULL DEFAULT 0,created_at TEXT NOT NULL,owner_id INTEGER REFERENCES users(id));
+    CREATE TABLE IF NOT EXISTS tasks(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,task_key TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',priority TEXT NOT NULL DEFAULT 'MEDIUM',effort DOUBLE PRECISION NOT NULL DEFAULT 1,risk_level TEXT NOT NULL DEFAULT 'MEDIUM',status TEXT NOT NULL DEFAULT 'NOT STARTED',owner TEXT NOT NULL DEFAULT 'Unassigned',due_date TEXT);
+    CREATE TABLE IF NOT EXISTS dependencies(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,from_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,to_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS risks(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,name TEXT NOT NULL,severity TEXT NOT NULL,score INTEGER NOT NULL,explanation TEXT NOT NULL,probability INTEGER NOT NULL,impact INTEGER NOT NULL,mitigation TEXT NOT NULL,affected_tasks TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS team_members(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,name TEXT NOT NULL,role TEXT NOT NULL,skills TEXT NOT NULL,availability INTEGER NOT NULL DEFAULT 80,workload INTEGER NOT NULL DEFAULT 0,daily_rate DOUBLE PRECISION NOT NULL DEFAULT 0,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL);
+    CREATE TABLE IF NOT EXISTS project_members(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL DEFAULT 'MEMBER',created_at TEXT NOT NULL,UNIQUE(project_id,user_id));
+    CREATE TABLE IF NOT EXISTS analyses(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,payload TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS scenarios(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,team_size INTEGER NOT NULL,deadline_days INTEGER NOT NULL,budget DOUBLE PRECISION NOT NULL,scope_factor DOUBLE PRECISION NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS notifications(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,type TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL,read INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS activity(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,title TEXT NOT NULL,detail TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS analytics_snapshots(id SERIAL PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,health INTEGER NOT NULL,progress INTEGER NOT NULL,risk_score DOUBLE PRECISION NOT NULL,workload DOUBLE PRECISION NOT NULL,critical_path_days DOUBLE PRECISION NOT NULL,created_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+    CREATE INDEX IF NOT EXISTS idx_dependencies_project ON dependencies(project_id);
+    CREATE INDEX IF NOT EXISTS idx_risks_project ON risks(project_id);
+    CREATE INDEX IF NOT EXISTS idx_team_project ON team_members(project_id);
+    CREATE INDEX IF NOT EXISTS idx_activity_project_created ON activity(project_id,created_at);
+    CREATE INDEX IF NOT EXISTS idx_snapshots_project_created ON analytics_snapshots(project_id,created_at);
+    """)
+
+
+def _run_postgres_migrations():
+    if os.getenv("NEXUS_AUTO_MIGRATE", "1") != "1":
+        return
+    try:
+        subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=str(BASE_DIR), check=True, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        app.logger.warning("Alembic auto-migration unavailable; applying safe bootstrap schema: %s", exc)
+
+
+def init_db():
+    c = db()
+
+    # Never run PostgreSQL migrations against the test database.
+    if _using_postgres():
+        _run_postgres_migrations()
+        _postgres_schema(c)
+    else:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'TEAM MEMBER',plan TEXT NOT NULL DEFAULT 'FREE',created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT NOT NULL,deadline_days INTEGER NOT NULL DEFAULT 14,team_size INTEGER NOT NULL DEFAULT 3,budget REAL NOT NULL DEFAULT 0,infrastructure_cost REAL NOT NULL DEFAULT 0,ai_cost REAL NOT NULL DEFAULT 0,created_at TEXT NOT NULL,owner_id INTEGER,FOREIGN KEY(owner_id) REFERENCES users(id));
+            CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,task_key TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',priority TEXT NOT NULL DEFAULT 'MEDIUM',effort REAL NOT NULL DEFAULT 1,risk_level TEXT NOT NULL DEFAULT 'MEDIUM',status TEXT NOT NULL DEFAULT 'NOT STARTED',owner TEXT NOT NULL DEFAULT 'Unassigned',due_date TEXT,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS dependencies(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,from_task INTEGER NOT NULL,to_task INTEGER NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,FOREIGN KEY(from_task) REFERENCES tasks(id) ON DELETE CASCADE,FOREIGN KEY(to_task) REFERENCES tasks(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS risks(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,name TEXT NOT NULL,severity TEXT NOT NULL,score INTEGER NOT NULL,explanation TEXT NOT NULL,probability INTEGER NOT NULL,impact INTEGER NOT NULL,mitigation TEXT NOT NULL,affected_tasks TEXT NOT NULL DEFAULT '',FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS team_members(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,name TEXT NOT NULL,role TEXT NOT NULL,skills TEXT NOT NULL,availability INTEGER NOT NULL DEFAULT 80,workload INTEGER NOT NULL DEFAULT 0,daily_rate REAL NOT NULL DEFAULT 0,user_id INTEGER,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL);
+            CREATE TABLE IF NOT EXISTS project_members(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,user_id INTEGER NOT NULL,role TEXT NOT NULL DEFAULT 'MEMBER',created_at TEXT NOT NULL,UNIQUE(project_id,user_id),FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS analyses(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS scenarios(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,team_size INTEGER NOT NULL,deadline_days INTEGER NOT NULL,budget REAL NOT NULL,scope_factor REAL NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,type TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL,read INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,title TEXT NOT NULL,detail TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS analytics_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER NOT NULL,health INTEGER NOT NULL,progress INTEGER NOT NULL,risk_score REAL NOT NULL,workload REAL NOT NULL,critical_path_days REAL NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+            """
+        )
+        ensure_column(c, "projects", "infrastructure_cost", "REAL NOT NULL DEFAULT 0")
+        ensure_column(c, "projects", "ai_cost", "REAL NOT NULL DEFAULT 0")
+        ensure_column(c, "team_members", "daily_rate", "REAL NOT NULL DEFAULT 0")
+    if not USE_POSTGRES:
+        c.execute("UPDATE team_members SET daily_rate=? WHERE daily_rate<=0", (float(os.getenv("NEXUS_DEFAULT_DAILY_RATE", "2000")),))
+    else:
+        c.execute("UPDATE team_members SET daily_rate=? WHERE daily_rate<=0", (float(os.getenv("NEXUS_DEFAULT_DAILY_RATE", "2000")),))
+    if not c.execute("SELECT 1 FROM users WHERE email=?", (DEMO_EMAIL,)).fetchone() and APP_ENV != "production" and os.getenv("NEXUS_ENABLE_DEMO", "1") == "1":
+        c.execute("INSERT INTO users(name,email,password_hash,role,plan,created_at) VALUES(?,?,?,?,?,?)", (DEMO_NAME, DEMO_EMAIL, generate_password_hash(DEMO_PASSWORD), "ADMIN", "FREE", now()))
+    c.commit(); c.close()
+
+def current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    c = db()
+    r = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    c.close()
+    return rowdict(r)
+
+
+def auth_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            return jsonify({"error": "Please log in first."}), 401
+        if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
+            token = request.headers.get("X-CSRF-Token")
+            if not token or token != session.get("csrf"):
+                return jsonify({"error": "CSRF validation failed. Refresh the workspace and try again."}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def project_owned(pid: int):
+    """Return a project the current user is authorized to access.
+    The historical helper name is retained for compatibility with earlier routes.
+    """
+    u=current_user()
+    if not u:return None
+    c=db()
+    if u["role"]=="ADMIN":
+        p=c.execute("SELECT * FROM projects WHERE id=?",(pid,)).fetchone()
+    else:
+        p=c.execute("SELECT p.* FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.user_id=? WHERE p.id=? AND (p.owner_id=? OR pm.user_id IS NOT NULL)",(u["id"],pid,u["id"])).fetchone()
+    c.close(); return rowdict(p)
+
+
+def can_manage_project(pid: int, user=None) -> bool:
+    user = user or current_user()
+    if not user:
+        return False
+    p = project_owned(pid)
+    if p and (p["owner_id"] == user["id"] or user["role"] == "ADMIN"):
+        return True
+    c = db(); r = c.execute("SELECT 1 FROM project_members WHERE project_id=? AND user_id=? AND role IN ('OWNER','ADMIN','MANAGER')", (pid, user["id"])).fetchone(); c.close()
+    return bool(r)
+
+def require_manager(pid: int):
+    u=current_user()
+    if not u: return jsonify({"error":"Please log in first."}),401
+    if not can_manage_project(pid,u): return jsonify({"error":"Manager or owner permission required."}),403
+    return None
+
+def parse_num(text, patterns, default):
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            try:
+                return max(1, int(m.group(1)))
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def _risk(name, severity, score, explanation, probability, impact, mitigation, affected=()):
+    return {"name": name, "severity": severity, "score": int(max(1, min(10, score))), "explanation": explanation,
+            "probability": int(probability), "impact": int(impact), "mitigation": mitigation, "affected_tasks": list(affected)}
+
+
+def _heuristic_analysis(description: str) -> dict[str, Any]:
+    t = description.strip()
+    l = t.lower()
+
+    deadline = parse_num(t, [r'(\d+)\s*days?', r'deadline\s*[:=]?\s*(\d+)'], 14)
+    team = parse_num(t, [r'team\s*(?:of|size)?\s*(\d+)', r'(\d+)\s*(?:developers|people|members|engineers)'], 3)
+
+    feature_rules = [
+        (['attendance', 'time tracking', 'check-in', 'check out'], 'Attendance Management', 'Implement employee attendance, check-in/check-out rules and attendance records.', 5.0, 'HIGH', 'Backend'),
+        (['leave', 'leave management', 'vacation'], 'Leave Management', 'Implement leave requests, approvals, balances and leave history.', 5.0, 'HIGH', 'Backend'),
+        (['productivity'], 'Productivity Tracking', 'Track productivity indicators and generate productivity summaries.', 5.0, 'HIGH', 'Backend'),
+        (['dashboard', 'manager dashboard', 'admin dashboard'], 'Dashboard', 'Build role-specific dashboards with important operational metrics.', 4.0, 'HIGH', 'Frontend'),
+        (['notification', 'notifications', 'alerts'], 'Notifications', 'Implement notifications, delivery state and read/unread handling.', 3.0, 'MEDIUM', 'Backend'),
+        (['report', 'reports', 'reporting', 'analytics'], 'Reporting & Analytics', 'Generate reports and analytics from project data.', 4.0, 'HIGH', 'Backend'),
+        (['login', 'authentication', 'sign in', 'signin'], 'Authentication', 'Implement secure login, sessions and authentication flows.', 3.0, 'CRITICAL', 'Security'),
+        (['role-based', 'role based', 'roles', 'authorization', 'permissions', 'permission', 'rbac'], 'Role-Based Access', 'Implement roles, permissions and authorization checks.', 3.0, 'CRITICAL', 'Security'),
+        (['database', 'data storage', 'sql', 'postgres', 'mysql', 'sqlite'], 'Database & Data Model', 'Design the database schema and persistence layer.', 4.0, 'HIGH', 'Backend'),
+        (['api', 'rest api', 'integration', 'external service'], 'API & Integrations', 'Implement API contracts and external service integrations.', 4.0, 'HIGH', 'Integrations'),
+        (['security', 'secure', 'security testing'], 'Security', 'Validate authorization, input handling, secrets and security controls.', 3.0, 'CRITICAL', 'Security'),
+        (['cloud', 'cloud deployment', 'deployment', 'deploy', 'aws', 'azure', 'gcp'], 'Cloud Deployment', 'Prepare staging, configuration, deployment and rollback procedures.', 4.0, 'HIGH', 'DevOps'),
+        (['mobile', 'android', 'ios'], 'Mobile Experience', 'Implement the required mobile user experience.', 4.0, 'HIGH', 'Frontend'),
+        (['iot', 'sensor', 'device'], 'IoT Integration', 'Connect devices or sensors and process operational data.', 5.0, 'HIGH', 'Integrations'),
+        (['payment', 'payments', 'billing', 'subscription'], 'Payments', 'Implement secure payment and transaction workflows.', 5.0, 'CRITICAL', 'Backend'),
+    ]
+
+    detected = []
+    for keywords, name, desc, effort, risk, owner in feature_rules:
+        if any(k in l for k in keywords):
+            detected.append({'name': name, 'description': desc, 'effort': effort, 'risk': risk, 'owner': owner})
+    unique = {}
+    for feature in detected:
+        unique[feature['name']] = feature
+    detected = list(unique.values())
+
+    tasks = []
+    def add_task(name, desc, effort, risk, owner):
+        tasks.append({'task_key': f'T{len(tasks)+1}', 'name': name, 'description': desc,
+                      'priority': 'CRITICAL' if risk == 'CRITICAL' else ('HIGH' if risk == 'HIGH' else 'MEDIUM'),
+                      'effort': float(effort), 'risk_level': risk, 'status': 'NOT STARTED', 'owner': owner})
+
+    add_task('Requirements', 'Define scope, acceptance criteria, constraints and success criteria.', 2.0, 'HIGH', 'Product Lead')
+    add_task('Architecture', 'Design application structure, data flow, APIs and technical boundaries.', 3.0, 'HIGH', 'Architect')
+    for feature in detected:
+        add_task(feature['name'], feature['description'], feature['effort'], feature['risk'], feature['owner'])
+    if not detected:
+        add_task('Core Implementation', 'Implement the primary workflow described by the project.', 6.0, 'HIGH', 'Backend')
+
+    add_task('Testing', 'Validate happy paths, failure paths, security and regressions.', 5.0 if deadline <= 7 else 4.0,
+             'CRITICAL' if deadline <= 7 else 'HIGH', 'QA')
+    add_task('Deployment', 'Prepare staging, release, rollback and production deployment procedures.', 3.0,
+             'HIGH' if deadline <= 10 else 'MEDIUM', 'DevOps')
+    add_task('Monitoring', 'Track application health, errors, failures and operational signals.', 2.0, 'MEDIUM', 'Operations')
+
+    deps = []
+    if len(tasks) >= 2:
+        deps.append(('T1', 'T2'))
+    for i in range(3, len(tasks)+1):
+        if tasks[i-1]['name'] not in ['Testing', 'Deployment', 'Monitoring']:
+            deps.append(('T2', f'T{i}'))
+    testing_key = next((x['task_key'] for x in tasks if x['name'] == 'Testing'), None)
+    deployment_key = next((x['task_key'] for x in tasks if x['name'] == 'Deployment'), None)
+    monitoring_key = next((x['task_key'] for x in tasks if x['name'] == 'Monitoring'), None)
+    if testing_key:
+        for task in tasks:
+            if task['task_key'] not in ['T1', testing_key] and task['name'] not in ['Deployment', 'Monitoring', 'Testing']:
+                deps.append((task['task_key'], testing_key))
+    if testing_key and deployment_key: deps.append((testing_key, deployment_key))
+    if deployment_key and monitoring_key: deps.append((deployment_key, monitoring_key))
+    deps = list(dict.fromkeys(deps))
+
+    risks = []
+    if any(x in l for x in ['login','authentication','auth','role','permission','security']):
+        risks.append(_risk('Security','HIGH',8,'Authentication, authorization and security controls can affect downstream release paths.',70,85,
+                           'Define roles, validation, authorization and secret handling before release.', []))
+    if any(x in l for x in ['employee','attendance','leave']):
+        risks.append(_risk('Data Accuracy','HIGH',7,'Incorrect employee, attendance or leave data can make operational reports unreliable.',65,80,
+                           'Define validation rules, audit important changes and test edge cases.', []))
+    if any(x in l for x in ['cloud','deployment','deploy']):
+        risks.append(_risk('Cloud Deployment','MEDIUM',6,'Limited deployment experience can create configuration and release problems.',60,70,
+                           'Use staging and perform a deployment rehearsal before production.', []))
+    if any(x in l for x in ['notification','notifications']):
+        risks.append(_risk('Notification Delivery','MEDIUM',5,'Notification failures can cause users to miss important workflow events.',50,65,
+                           'Test delivery failures, retries and notification state handling.', []))
+    if any(x in l for x in ['payment','payments','billing']):
+        risks.append(_risk('Payment','CRITICAL',9,'Payment flows require correctness, security and failure-path testing.',80,90,
+                           'Use sandbox transactions, idempotency and explicit success/failure testing.', []))
+    if any(x in l for x in ['requirements may change','requirements can change','requirements change']):
+        risks.append(_risk('Scope Change','HIGH',7,'Changing requirements can create rework and disrupt the critical path.',70,75,
+                           'Freeze must-have scope and use controlled change approval.', []))
+    if deadline <= 10:
+        risks.append(_risk('Schedule','HIGH',8 if deadline <= 7 else 7,'The delivery window leaves limited recovery time if critical work slips.',75,85,
+                           'Protect the critical path and freeze non-essential scope.', []))
+    if team < 3:
+        risks.append(_risk('Resource Shortage','HIGH',8,'A small team can become a bottleneck when multiple critical tasks need attention.',70,80,
+                           'Reduce scope or add capacity to critical-path work.', []))
+    risks.append(_risk('Testing','HIGH' if deadline <= 10 else 'MEDIUM',7 if deadline <= 10 else 5,
+                       'Late testing increases rework and compresses the release recovery window.',60,75,
+                       'Start testing before implementation is completely finished.', []))
+
+    scope = [x['name'] for x in detected] or ['Core Application']
+    actions = [
+        'Freeze must-have scope before implementation.',
+        'Protect the calculated critical path and parallelize independent work.',
+        'Test failure paths early instead of waiting for final QA.'
+    ]
+    if any(x in l for x in ['cloud','deployment']):
+        actions.append('Run a staging deployment before final QA.')
+    if any(x in l for x in ['requirements may change','requirements can change','requirements change']):
+        actions.append('Use controlled scope changes so requirement changes do not destabilize the release plan.')
+    if any(x in l for x in ['attendance','leave','employee']):
+        actions.append('Validate employee, attendance and leave data rules before building reports.')
+    actions.append('Review the project after every material scope, dependency or deadline change.')
+
+    project_name = 'NEXUS-X Project'
+    if 'attendance' in l and 'employee' in l: project_name = 'Employee Attendance & Productivity Platform'
+    elif 'attendance' in l: project_name = 'Attendance Management Platform'
+    elif 'payment' in l: project_name = 'Payment Platform'
+    elif 'iot' in l: project_name = 'IoT Monitoring Platform'
+    elif 'dashboard' in l: project_name = 'Business Dashboard Platform'
+
+    return {'project_name': project_name, 'objective': t[:180], 'deadline_days': deadline, 'team_size': team,
+            'scope': scope, 'requirements': scope, 'tasks': tasks, 'dependencies': deps, 'risks': risks, 'actions': actions}
+
+def _parse_llm_json(text: str):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def analyze_description(description: str) -> tuple[dict[str, Any], str]:
+    fallback = _heuristic_analysis(description)
+    if not (os.getenv("OPENAI_API_KEY") and OpenAI):
+        return fallback, "heuristic"
+    schema = {"project_name": "string", "objective": "string", "deadline_days": 14, "team_size": 3,
+              "scope": ["string"], "requirements": ["string"], "tasks": [{"task_key": "T1", "name": "string", "description": "string", "priority": "HIGH", "effort": 2, "risk_level": "MEDIUM", "status": "NOT STARTED", "owner": "string"}],
+              "dependencies": [["T1", "T2"]], "risks": [{"name": "string", "severity": "HIGH", "score": 7, "explanation": "string", "probability": 70, "impact": 80, "mitigation": "string", "affected_tasks": ["T1"]}],
+              "actions": ["string"]}
+    prompt = f"""You are NEXUS-X Analyzer. Convert this messy project/work description into a practical execution model. Return ONLY valid JSON matching this schema. Do not invent precise facts that are not inferable; use reasonable estimates for effort (person-days) and clearly explain risks. Create 5-12 concrete tasks, dependency pairs, and 3-8 risks.\nSCHEMA: {json.dumps(schema)}\nDESCRIPTION: {description}"""
+    try:
+        client = OpenAI()
+        resp = client.responses.create(model=os.getenv("NEXUS_MODEL", "gpt-5"), input=prompt)
+        parsed = _parse_llm_json(resp.output_text)
+        if parsed and isinstance(parsed.get("tasks"), list) and isinstance(parsed.get("risks"), list):
+            # Fill missing operational fields from the deterministic engine so downstream calculations stay safe.
+            parsed.setdefault("deadline_days", fallback["deadline_days"])
+            parsed.setdefault("team_size", fallback["team_size"])
+            parsed.setdefault("project_name", fallback["project_name"])
+            parsed.setdefault("objective", description[:180])
+            parsed.setdefault("actions", fallback["actions"])
+            return parsed, "llm"
+    except Exception as exc:
+        app.logger.warning("Analyzer LLM unavailable: %s", exc)
+    return fallback, "heuristic"
+
+
+def build_graph(tasks, deps):
+    by_key = {t["task_key"]: t for t in tasks}
+    graph = {k: [] for k in by_key}
+    incoming = {k: [] for k in by_key}
+    for d in deps:
+        a, b = d["from_task"], d["to_task"]
+        if a in by_key and b in by_key and a != b:
+            graph[a].append(b); incoming[b].append(a)
+    return by_key, graph, incoming
+
+
+def critical_path(tasks, deps):
+    by_key, graph, incoming = build_graph(tasks, deps)
+    indegree = {k: len(v) for k, v in incoming.items()}
+    queue = [k for k, v in indegree.items() if v == 0]
+    order = []
+    while queue:
+        k = queue.pop(0); order.append(k)
+        for nxt in graph[k]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0: queue.append(nxt)
+    if len(order) != len(by_key):
+        return {"has_cycle": True, "path": [], "duration": 0.0, "slack": {}, "earliest": {}, "latest": {}}
+
+    es = {k: 0.0 for k in by_key}; ef = {}
+    for k in order:
+        es[k] = max((ef[p] for p in incoming[k]), default=0.0)
+        ef[k] = es[k] + float(by_key[k].get("effort", 1) or 1)
+    duration = max(ef.values(), default=0.0)
+    lf = {k: duration for k in by_key}; ls = {}
+    for k in reversed(order):
+        lf[k] = min((ls[n] for n in graph[k]), default=duration)
+        ls[k] = lf[k] - float(by_key[k].get("effort", 1) or 1)
+    slack = {k: round(max(0.0, ls[k] - es[k]), 2) for k in by_key}
+    path = [k for k in order if slack[k] <= 0.01]
+    return {"has_cycle": False, "path": path, "duration": round(duration, 2), "slack": slack,
+            "earliest": {k: round(es[k], 2) for k in es}, "latest": {k: round(ls[k], 2) for k in ls}}
+
+
+def live_risk_engine(project, tasks, deps, team, cp):
+    """Recalculate risk from current project state instead of trusting stale scores."""
+    risks=[]
+    total=max(1.0,sum(float(t.get('effort') or 0) for t in tasks))
+    blocked=sum(float(t.get('effort') or 0) for t in tasks if t.get('status')=='BLOCKED')
+    unfinished=sum(float(t.get('effort') or 0) for t in tasks if t.get('status')!='COMPLETED')
+    deadline=max(1,float(project.get('deadline_days') or 1))
+    schedule_ratio=(cp.get('duration',0)/deadline) if not cp.get('has_cycle') else 2
+    avg_workload=(sum(float(m.get('workload') or 0) for m in team)/len(team)) if team else 0
+    capacity=max(1,float(project.get('team_size') or 1)*deadline*.75)
+    utilization=unfinished/capacity*100
+
+    def add(name, score, probability, impact, severity, why, mitigation, affected=()):
+        score=int(max(1,min(10,round(score))))
+        sev='CRITICAL' if score>=9 else 'HIGH' if score>=7 else 'MEDIUM' if score>=4 else 'LOW'
+        risks.append(_risk(name, sev, score, why, int(max(1,min(100,round(probability)))), int(max(1,min(100,round(impact)))), mitigation, affected))
+
+    if cp.get('has_cycle'):
+        add('Dependency Cycle',10,95,95,'CRITICAL','A dependency cycle prevents reliable scheduling and can block downstream work.','Remove or reverse the dependency that closes the cycle.')
+    elif schedule_ratio>1:
+        add('Schedule',8+min(2,round((schedule_ratio-1)*4)),78,90,'HIGH',f'Critical-path effort is {cp["duration"]} days against a {deadline:g}-day deadline.','Reduce scope, add capacity, or move the deadline.',cp.get('path',[]))
+    elif schedule_ratio>.8:
+        add('Schedule',6,62,75,'MEDIUM','The critical path is consuming most of the available deadline.','Protect critical-path work and review scope before adding new work.',cp.get('path',[]))
+
+    if blocked:
+        add('Blocked Work',7+min(2,round(blocked/total*4)),70,85,'HIGH',f'{blocked:.1f} effort is currently blocked, creating downstream delay pressure.','Resolve the blocking dependency and re-check the critical path.')
+    if avg_workload>90 or utilization>100:
+        add('Capacity',8,75,80,'HIGH',f'Team workload/capacity is under pressure ({avg_workload:.0f}% recorded workload, {utilization:.0f}% estimated utilization).','Rebalance ownership, reduce scope, or add capacity.')
+    elif avg_workload>80 or utilization>85:
+        add('Capacity',6,55,65,'MEDIUM','Team capacity is becoming constrained.','Rebalance work before critical-path tasks are affected.')
+
+    high_degree={}
+    for d in deps:
+        high_degree[d['to_task']]=high_degree.get(d['to_task'],0)+1
+    overloaded=[k for k,v in high_degree.items() if v>=3]
+    if overloaded:
+        add('Dependency Pressure',7,65,72,'HIGH',f'{len(overloaded)} task(s) have three or more upstream dependencies.','Sequence high-dependency tasks early and remove unnecessary coupling.',overloaded)
+
+    # Preserve domain-specific risks, but rescore them using current pressure.
+    text=' '.join(str(t.get('name',''))+' '+str(t.get('description','')) for t in tasks).lower()
+    if 'payment' in text or 'transaction' in text:
+        add('Payment',7 + (1 if schedule_ratio>0.8 else 0) + (1 if blocked else 0),65,90,'HIGH','Payment work is a high-impact release path and is sensitive to schedule, security and failure-path testing.','Use sandbox transactions, idempotency, reconciliation and explicit failure-path tests.',[t['task_key'] for t in tasks if 'integr' in t.get('name','').lower() or 'test' in t.get('name','').lower()])
+    if 'security' in text or 'auth' in text or 'login' in text:
+        add('Security',7 + (1 if schedule_ratio>0.9 else 0),55,88,'HIGH','Authentication and security controls can affect every downstream release path.','Validate authorization, input handling, secrets and security tests before release.')
+
+    # Deduplicate by name, keeping the highest score.
+    unique={}
+    for r in risks:
+        if r['name'] not in unique or r['score']>unique[r['name']]['score']: unique[r['name']]=r
+    if not unique:
+        add('Scope',4,40,55,'MEDIUM','No dominant technical risk is currently detected, but scope can still create rework.','Keep acceptance criteria explicit and review changes before adding work.')
+    return sorted(unique.values(),key=lambda r:r['score'],reverse=True)
+
+
+def health_engine(project, tasks, risks, team, cp):
+    total_effort = sum(float(t.get('effort') or 0) for t in tasks) or 1
+    completed_effort = sum(float(t.get('effort') or 0) for t in tasks if t.get('status') == 'COMPLETED')
+    progress = round(completed_effort / total_effort * 100)
+    blocked_effort = sum(float(t.get('effort') or 0) for t in tasks if t.get('status') == 'BLOCKED')
+    avg_risk = sum(int(r['score']) for r in risks) / max(1, len(risks))
+    deadline=max(1,float(project.get('deadline_days') or 1))
+    schedule_ratio=cp.get('duration',0)/deadline if not cp.get('has_cycle') else 2
+    schedule_score=max(0,min(100,round(100 - max(0,schedule_ratio-.65)*180)))
+    risk_score=max(0,min(100,round(100-avg_risk*6-len([r for r in risks if r['score']>=7])*4)))
+    blocker_score=max(0,min(100,round(100-blocked_effort/total_effort*100)))
+    cp_score=20 if cp.get('has_cycle') else max(0,min(100,round(100-max(0,cp.get('duration',0)-deadline)*14)))
+    recorded_workload=(sum(float(m.get('workload') or 0) for m in team)/len(team)) if team else 0
+    capacity=max(1,float(project.get('team_size') or 1)*deadline*.75)
+    utilization=(total_effort-completed_effort)/capacity*100
+    workload_pressure=max(recorded_workload,utilization)
+    workload_score=max(0,min(100,round(100-max(0,workload_pressure-70)*2)))
+    dependency_pressure=min(100,sum(1 for _ in []))
+    dependency_pressure=max(0,min(100,round((len(cp.get('path',[]))/max(1,len(tasks)))*100)))
+    dependency_score=max(0,100-round(dependency_pressure*.25))
+    components={'progress':progress,'schedule':schedule_score,'risk':risk_score,'blockers':blocker_score,'critical_path':cp_score,'workload':workload_score,'dependencies':dependency_score}
+    health=round(progress*.28+schedule_score*.20+risk_score*.18+blocker_score*.10+cp_score*.12+workload_score*.07+dependency_score*.05)
+    health=max(0,min(100,health))
+    status='HEALTHY' if health>=80 else 'NEEDS ATTENTION' if health>=60 else 'AT RISK'
+    reasons=[]
+    if cp.get('has_cycle'): reasons.append('A dependency cycle prevents reliable scheduling.')
+    elif cp.get('duration',0)>deadline: reasons.append(f'Critical path is {cp["duration"]} days versus a {deadline:g}-day deadline.')
+    if risks:
+            top_name = risks[0].get("name") or "Top identified risk"
+            reasons.append(f'Top risk is {top_name} at {risks[0].get("score", 0)}/10.')
+    if blocked_effort: reasons.append(f'{blocked_effort:.1f} effort is blocked.')
+    if workload_pressure>85: reasons.append(f'Capacity pressure is {workload_pressure:.0f}%.')
+    if not reasons: reasons.append('No dominant constraint is currently detected.')
+    return {'health':health,'health_status':status,'progress':progress,'total_effort':round(total_effort,1),'completed_effort':round(completed_effort,1),'capacity':round(capacity,1),'blocked':sum(t.get('status')=='BLOCKED' for t in tasks),'high_risks':len([r for r in risks if r['score']>=7]),'risk_average':round(avg_risk,1),'utilization':round(utilization),'components':components,'explanation':reasons}
+
+def record_snapshot(pid, s):
+    try:
+        c=db()
+        latest=c.execute("SELECT health,progress,risk_score,workload,critical_path_days FROM analytics_snapshots WHERE project_id=? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+        vals=(int(s.get("health",0)),int(s.get("progress",0)),float(s.get("risk_average",0) or 0),float(s.get("utilization",0) or 0),float(s.get("critical_path_duration",0) or 0))
+        should_write=latest is None or any(abs(float(vals[i])-float(latest[i]))>0.01 for i in range(5))
+        if should_write:
+            c.execute("INSERT INTO analytics_snapshots(project_id,health,progress,risk_score,workload,critical_path_days,created_at) VALUES(?,?,?,?,?,?,?)", (pid,*vals,now()))
+            c.execute("DELETE FROM analytics_snapshots WHERE project_id=? AND id NOT IN (SELECT id FROM analytics_snapshots WHERE project_id=? ORDER BY id DESC LIMIT 120)", (pid,pid))
+            c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def project_cost_estimate(project, tasks, team, extra_infra=0.0, extra_ai=0.0):
+    default_rate=float(os.getenv("NEXUS_DEFAULT_DAILY_RATE", "2000"))
+    rates={str(m.get("name")):float(m.get("daily_rate") or default_rate) for m in team}
+    avg=statistics.mean(rates.values()) if rates else default_rate
+    labor=sum(float(t.get("effort") or 0)*rates.get(str(t.get("owner") or ""),avg) for t in tasks)
+    infrastructure=float(project.get("infrastructure_cost") or 0)+float(extra_infra or 0)
+    ai=float(project.get("ai_cost") or 0)+float(extra_ai or 0)
+    task_costs=[]
+    for t in tasks:
+        rate=rates.get(str(t.get("owner") or ""),avg)
+        cost=float(t.get("effort") or 0)*rate
+        task_costs.append({"task_key":t.get("task_key"),"name":t.get("name"),"effort":round(float(t.get("effort") or 0),2),"daily_rate":round(rate,2),"labor_cost":round(cost,2)})
+    total=labor+infrastructure+ai
+    return {"labor":round(labor,2),"infrastructure":round(infrastructure,2),"ai":round(ai,2),"total":round(total,2),"daily_rate":round(avg,2),"task_costs":task_costs}
+
+
+def project_state(pid):
+    p = project_owned(pid)
+    if not p:
+        return None
+    c = db()
+    tasks = [rowdict(x) for x in c.execute("SELECT * FROM tasks WHERE project_id=? ORDER BY id", (pid,)).fetchall()]
+    deps = [rowdict(x) for x in c.execute("SELECT d.id,a.task_key from_task,b.task_key to_task FROM dependencies d JOIN tasks a ON a.id=d.from_task JOIN tasks b ON b.id=d.to_task WHERE d.project_id=?", (pid,)).fetchall()]
+    stored_risks = [rowdict(x) for x in c.execute("SELECT * FROM risks WHERE project_id=? ORDER BY score DESC", (pid,)).fetchall()]
+    team = [rowdict(x) for x in c.execute("SELECT * FROM team_members WHERE project_id=?", (pid,)).fetchall()]
+    c.close()
+    cp = critical_path(tasks, deps)
+    risks = live_risk_engine(p, tasks, deps, team, cp)
+    h = health_engine(p, tasks, risks, team, cp)
+    path_details = []
+    for key in cp["path"]:
+        t = next((x for x in tasks if x["task_key"] == key), None)
+        if t:
+            path_details.append({"task_key": key, "name": t["name"], "effort": t["effort"], "slack": cp["slack"].get(key, 0)})
+    state={"project": p, "tasks": tasks, "dependencies": deps, "risks": risks, "team": team, **h,
+            "critical_path": cp["path"], "critical_path_details": path_details, "critical_path_duration": cp["duration"],
+            "critical_path_slack": max(0, round(p["deadline_days"] - cp["duration"], 2)), "dependency_cycle": cp["has_cycle"]}
+    state["cost_estimate"] = project_cost_estimate(p,tasks,team)
+    record_snapshot(pid,state)
+    return state
+
+
+def add_activity(pid, title, detail):
+    c = db(); c.execute("INSERT INTO activity(project_id,title,detail,created_at) VALUES(?,?,?,?)", (pid, title, detail, now())); c.commit(); c.close()
+
+
+def refresh_notifications(pid):
+    s = project_state(pid)
+    if not s: return
+    c = db()
+    # Keep one active notification per semantic event instead of recreating duplicates on every refresh.
+    desired = []
+    if s["health"] < 60:
+        desired.append(("HEALTH", "Project health is at risk", f"Health is {s['health']}%: " + " ".join(s["explanation"])))
+    for r in s["risks"]:
+        if r["severity"] in ("HIGH", "CRITICAL"):
+            desired.append(("RISK", f"{r['name']} risk", r["mitigation"]))
+    for t in s["tasks"]:
+        if t["status"] == "BLOCKED": desired.append(("BLOCKER", f"{t['name']} is blocked", "Resolve its dependency before downstream work."))
+    existing = {(r["type"], r["title"]): r for r in c.execute("SELECT * FROM notifications WHERE project_id=?", (pid,)).fetchall()}
+    for typ, title, message in desired:
+        if (typ, title) not in existing:
+            c.execute("INSERT INTO notifications(project_id,type,title,message,created_at) VALUES(?,?,?,?,?)", (pid, typ, title, message, now()))
+    active_keys = {(x[0], x[1]) for x in desired}
+    for key, row in existing.items():
+        if key not in active_keys and not row["read"]:
+            c.execute("DELETE FROM notifications WHERE id=?", (row["id"],))
+    c.commit(); c.close()
+
+
+def seed_project(name, description, owner_id):
+    a, mode = analyze_description(description)
+    # Run deterministic calculations on whatever the analyzer produced.
+    c = db()
+    cur = c.execute("INSERT INTO projects(name,description,deadline_days,team_size,owner_id,created_at) VALUES(?,?,?,?,?,?)", (name, description, int(a.get("deadline_days",14)), int(a.get("team_size",3)), owner_id, now()))
+    pid = cur.lastrowid
+    ids = {}
+    for x in a["tasks"]:
+        ids[x["task_key"]] = c.execute("INSERT INTO tasks(project_id,task_key,name,description,priority,effort,risk_level,status,owner) VALUES(?,?,?,?,?,?,?,?,?)", (pid, x["task_key"], x["name"], x.get("description", ""), x.get("priority", "MEDIUM"), float(x.get("effort", 1)), x.get("risk_level", "MEDIUM"), x.get("status", "NOT STARTED"), x.get("owner", "Unassigned"))).lastrowid
+    for fr, to in a.get("dependencies", []):
+        if fr in ids and to in ids and fr != to: c.execute("INSERT INTO dependencies(project_id,from_task,to_task) VALUES(?,?,?)", (pid, ids[fr], ids[to]))
+    for r in a.get("risks", []):
+        c.execute("INSERT INTO risks(project_id,name,severity,score,explanation,probability,impact,mitigation,affected_tasks) VALUES(?,?,?,?,?,?,?,?,?)", (pid, r["name"], r["severity"], int(r["score"]), r["explanation"], int(r.get("probability",60)), int(r.get("impact",70)), r["mitigation"], ",".join(r.get("affected_tasks", []))))
+    members = [("Alex", "Frontend", "UI, React, CSS", 85, 25, 1800), ("Riya", "Backend", "Python, APIs, SQL", 90, 35, 2400), ("Dev", "QA / Security", "Testing, security, automation", 70, 20, 2200)]
+    for m in members[:max(1, min(3, int(a.get("team_size",3))))]: c.execute("INSERT INTO team_members(project_id,name,role,skills,availability,workload,daily_rate) VALUES(?,?,?,?,?,?,?)", (pid, *m))
+    c.execute("INSERT INTO analyses(project_id,payload,created_at) VALUES(?,?,?)", (pid, json.dumps({**a, "analysis_mode": mode}), now()))
+    c.execute("INSERT INTO project_members(project_id,user_id,role,created_at) VALUES(?,?,?,?) ON CONFLICT (project_id,user_id) DO NOTHING", (pid,owner_id,"OWNER",now()))
+    c.commit(); c.close()
+    add_activity(pid, "Project created", f"{mode.upper()} analysis generated {len(a['tasks'])} tasks, {len(a.get('dependencies',[]))} dependencies and {len(a.get('risks',[]))} risks.")
+    refresh_notifications(pid)
+    return pid
+
+
+# ---------------- Routes ----------------
+@app.get("/")
+def home(): return send_from_directory(FRONTEND_DIR, "index.html")
+
+@app.get("/<path:path>")
+def static_files(path): return send_from_directory(FRONTEND_DIR, path)
+
+@app.post("/api/signup")
+@rate_limit(12,60)
+def signup():
+    d=request.get_json(silent=True) or {}
+    name=(d.get("name") or "").strip()[:80]
+    email=(d.get("email") or "").strip().lower()
+    password=d.get("password") or ""
+    if len(name)<2 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$",email): return jsonify({"error":"Enter a valid name and email."}),400
+    if len(password)<8: return jsonify({"error":"Password must be at least 8 characters."}),400
+    c=db()
+    try:
+        uid=c.execute("INSERT INTO users(name,email,password_hash,role,plan,created_at) VALUES(?,?,?,?,?,?)",(name,email,generate_password_hash(password),"TEAM MEMBER","FREE",now())).lastrowid
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close(); return jsonify({"error":"An account with that email already exists."}),409
+    c.close(); session["uid"]=uid; session["csrf"]=os.urandom(16).hex()
+    return jsonify({"ok":True,"user":{"id":uid,"name":name,"email":email,"role":"TEAM MEMBER","plan":"FREE"},"csrf":session["csrf"]})
+
+@app.post("/api/login")
+@rate_limit(12,60)
+def login():
+    d = request.get_json(silent=True) or {}; email = (d.get("email") or DEMO_EMAIL).strip().lower(); password = d.get("password") or DEMO_PASSWORD
+    c = db(); u = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not u or not check_password_hash(u["password_hash"], password): c.close(); return jsonify({"error": "Invalid email or password. Demo: demo@nexus-x.local / demo123"}), 401
+    session["uid"] = u["id"]; session["csrf"] = os.urandom(16).hex(); c.close()
+    return jsonify({"ok": True, "user": {k: u[k] for k in ["id","name","email","role","plan"]}, "csrf": session["csrf"]})
+
+@app.post("/api/logout")
+def logout():
+    """
+    Logout is intentionally idempotent and does not require CSRF.
+
+    Logging out only destroys the current session. It does not create,
+    modify, or expose privileged application state, so requiring a CSRF
+    token here adds friction without meaningful security benefit.
+    """
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.get("/api/me")
+def me():
+    u = current_user(); return jsonify({"user": ({k:u[k] for k in ["id","name","email","role","plan"]} if u else None),"csrf":session.get("csrf") if u else None})
+
+@app.patch("/api/me")
+@auth_required
+def update_me():
+    d=request.get_json(silent=True) or {}; u=current_user(); name=(d.get("name") or u["name"]).strip()[:80]
+    if len(name)<2:return jsonify({"error":"Name is too short."}),400
+    c=db(); c.execute("UPDATE users SET name=? WHERE id=?",(name,u["id"])); c.commit(); c.close(); return jsonify({"user":{**{k:u[k] for k in ["id","email","role","plan"]},"name":name}})
+
+@app.post("/api/me/password")
+@auth_required
+def change_password():
+    d=request.get_json(silent=True) or {}; old=d.get("old_password") or ""; new=d.get("new_password") or ""; u=current_user()
+    if not check_password_hash(u["password_hash"],old):return jsonify({"error":"Current password is incorrect."}),400
+    if len(new)<8:return jsonify({"error":"New password must be at least 8 characters."}),400
+    c=db(); c.execute("UPDATE users SET password_hash=? WHERE id=?",(generate_password_hash(new),u["id"])); c.commit(); c.close(); return jsonify({"ok":True})
+
+@app.get("/api/health")
+def health(): return jsonify({"name":"NEXUS-X","status":"online","ai":"llm" if os.getenv("OPENAI_API_KEY") and OpenAI else "local-fallback","phase":"5-verification","features":["analyzer-2","critical-path","health-engine","risk-engine","what-if","team-recommendation","analytics-snapshots","builder-2","csrf","rate-limit"]})
+
+
+def universal_analysis(description: str) -> tuple[dict[str, Any], str]:
+    """
+    Universal analysis adapter.
+
+    Keeps the legacy analyzer for deadline/team extraction and backward
+    compatibility, while using UniversalProjectBuilder for the actual
+    project-specific understanding, modules, requirements, tasks, risks,
+    dependencies, architecture and technology.
+    """
+
+    description = (description or "").strip()
+
+    if not description:
+        return _heuristic_analysis("Build a general software project"), "heuristic"
+
+    fallback = _heuristic_analysis(description)
+
+    if UniversalProjectBuilder is None:
+        return fallback, "heuristic"
+
+    try:
+        built = UniversalProjectBuilder.build(description)
+
+        understanding = built.get("understanding") or {}
+        requirements = built.get("requirements") or []
+        modules = built.get("modules") or []
+        tasks = built.get("tasks") or []
+        dependencies = built.get("dependencies") or []
+        risks = built.get("risks") or []
+        team_roles = built.get("team_roles") or []
+
+        # Convert dataclass/dict objects safely.
+        def obj_dict(x):
+            if isinstance(x, dict):
+                return dict(x)
+            if hasattr(x, "to_dict"):
+                return x.to_dict()
+            return dict(getattr(x, "__dict__", {}))
+
+        requirement_rows = [obj_dict(x) for x in requirements]
+        module_rows = [obj_dict(x) for x in modules]
+        task_rows_raw = [obj_dict(x) for x in tasks]
+        team_rows = [obj_dict(x) for x in team_roles]
+
+        # Normalize tasks into the legacy NEXUS-X task schema.
+        task_rows = []
+
+        for i, task in enumerate(task_rows_raw, start=1):
+            task_key = task.get("task_key") or f"T{i}"
+
+            task_rows.append({
+                "task_key": task_key,
+                "name": task.get("name") or f"Task {i}",
+                "description": task.get("description") or "",
+                "priority": task.get("priority") or "MEDIUM",
+                "effort": float(task.get("effort") or 1),
+                "risk_level": task.get("risk_level") or "MEDIUM",
+                "status": task.get("status") or "NOT STARTED",
+                "owner": task.get("owner") or task.get("owner_role") or "Unassigned",
+                "module_id": task.get("module_id"),
+                "phase": task.get("phase"),
+                "acceptance_criteria": task.get("acceptance_criteria") or [],
+                "critical_path_eligible": task.get(
+                    "critical_path_eligible", True
+                ),
+            })
+
+        # Normalize dependencies to the legacy [from, to] representation.
+        dep_rows = []
+
+        for dep in dependencies:
+            if isinstance(dep, (list, tuple)) and len(dep) >= 2:
+                dep_rows.append([dep[0], dep[1]])
+            elif isinstance(dep, dict):
+                a = dep.get("from_task") or dep.get("from")
+                b = dep.get("to_task") or dep.get("to")
+                if a and b:
+                    dep_rows.append([a, b])
+
+        # Universal Builder risks are preferred.
+        # Fall back only if the builder did not produce usable risks.
+        risk_rows = [
+            obj_dict(r) for r in risks
+            if isinstance(r, dict) or hasattr(r, "__dict__")
+        ]
+
+        if not risk_rows:
+            risk_rows = fallback.get("risks", [])
+
+        # Build a useful project name from the user's actual request.
+        cleaned = re.sub(
+            r"^\s*(build|create|develop|design|make|implement)\s+",
+            "",
+            description,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        cleaned = re.split(
+            r"\s+\b(with|using|including|in|for)\b",
+            cleaned,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .:-")
+
+        if cleaned and 4 <= len(cleaned) <= 100:
+            project_name = cleaned.title()
+        else:
+            project_type = understanding.get("project_type")
+            project_name = (
+                f"{project_type} Project"
+                if project_type
+                else fallback.get("project_name", "NEXUS-X Project")
+            )
+
+        # Scope is now domain-specific instead of generic.
+        scope = []
+
+        for module in module_rows:
+            name = module.get("name")
+            if name and name not in scope:
+                scope.append(name)
+
+        for feature in understanding.get("major_features", []) or []:
+            if feature not in scope:
+                scope.append(feature)
+
+        if not scope:
+            scope = fallback.get("scope", [])
+
+        requirement_text = [
+            r.get("description") or r.get("title")
+            for r in requirement_rows
+            if r.get("description") or r.get("title")
+        ]
+
+        if not requirement_text:
+            requirement_text = [
+                t["description"]
+                for t in task_rows
+                if t.get("description")
+            ]
+
+        result = dict(fallback)
+
+        result.update({
+            "project_name": project_name,
+            "objective": description,
+            "scope": scope,
+            "requirements": requirement_text,
+            "tasks": task_rows,
+            "dependencies": dep_rows,
+            "risks": risk_rows,
+            "modules": module_rows,
+            "team_roles": team_rows,
+            "architecture": built.get("architecture") or {},
+            "technology": built.get("technology") or {},
+            "understanding": understanding,
+            "builder_version": "UniversalProjectBuilder",
+        })
+
+        return result, "universal"
+
+    except Exception as exc:
+        app.logger.exception("Universal Builder analysis failed: %s", exc)
+        return fallback, "heuristic"
+
+@app.post("/api/analyze")
+@rate_limit(30,60)
+def analyze():
+    d = request.get_json(silent=True) or {}; desc = (d.get("description") or "").strip()
+    if not desc: return jsonify({"error":"Please describe the problem or project."}), 400
+    a, mode = universal_analysis(desc)
+    # Compute deterministic critical path/health for analysis preview.
+    pseudo_project = {"deadline_days": int(a.get("deadline_days",14)), "team_size": int(a.get("team_size",3))}
+    pseudo_tasks = [{"task_key":x["task_key"],"name":x["name"],"effort":float(x.get("effort",1)),"status":x.get("status","NOT STARTED"),"owner":x.get("owner","Unassigned")} for x in a["tasks"]]
+    pseudo_deps = [{"from_task":x[0],"to_task":x[1]} for x in a.get("dependencies",[])]
+    cp = critical_path(pseudo_tasks,pseudo_deps); h = health_engine(pseudo_project,pseudo_tasks,a.get("risks",[]),[],cp)
+    a.update({"analysis_mode":mode,"critical_path":cp["path"],"critical_path_details":[{"task_key":k,"name":next(t["name"] for t in pseudo_tasks if t["task_key"]==k),"effort":next(t["effort"] for t in pseudo_tasks if t["task_key"]==k),"slack":cp["slack"].get(k,0)} for k in cp["path"]],"critical_path_duration":cp["duration"],"dependency_cycle":cp["has_cycle"],**h})
+    return jsonify({"analysis":a})
+
+@app.post("/api/projects")
+@auth_required
+def create_project():
+    d = request.get_json(silent=True) or {}; name=(d.get("name") or "NEXUS-X Project").strip()[:100]; desc=(d.get("description") or "").strip()[:4000]
+    if not desc: return jsonify({"error":"Project description is required."}),400
+    return jsonify(project_state(seed_project(name,desc,current_user()["id"])))
+
+@app.post("/api/projects/demo")
+@auth_required
+def demo():
+    return jsonify(project_state(seed_project("College Event Command Center","Launch a college event platform in 10 days with a team of 3 people including registration, login, payments, notifications, analytics, security, testing and deployment.",current_user()["id"])))
+
+@app.get("/api/users")
+@auth_required
+def users():
+    u=current_user()
+    if u["role"]!="ADMIN":return jsonify({"error":"Admin permission required."}),403
+    c=db(); rows=[rowdict(x) for x in c.execute("SELECT id,name,email,role,plan,created_at FROM users ORDER BY id DESC").fetchall()]; c.close(); return jsonify({"users":rows})
+
+@app.patch("/api/users/<int:uid>")
+@auth_required
+def update_user(uid):
+    u=current_user()
+    if u["role"]!="ADMIN":return jsonify({"error":"Admin permission required."}),403
+    d=request.get_json(silent=True) or {}; role=d.get("role"); plan=d.get("plan")
+    roles={"ADMIN","MANAGER","TEAM MEMBER","VIEWER"}; plans={"FREE","PRO","ENTERPRISE"}
+    if role not in roles or plan not in plans:return jsonify({"error":"Invalid role or plan."}),400
+    c=db(); r=c.execute("UPDATE users SET role=?,plan=? WHERE id=?",(role,plan,uid)); c.commit(); c.close()
+    if not r.rowcount:return jsonify({"error":"User not found."}),404
+    return jsonify({"ok":True})
+
+@app.get("/api/projects")
+@auth_required
+def projects():
+    u=current_user(); c=db()
+    if u["role"]=="ADMIN": rows=[rowdict(x) for x in c.execute("SELECT * FROM projects ORDER BY id DESC").fetchall()]
+    else: rows=[rowdict(x) for x in c.execute("SELECT DISTINCT p.* FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.user_id=? WHERE p.owner_id=? OR pm.user_id IS NOT NULL ORDER BY p.id DESC",(u["id"],u["id"])).fetchall()]
+    c.close(); return jsonify({"projects":rows})
+
+@app.get("/api/projects/<int:pid>")
+@auth_required
+def get_project(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    return jsonify(s)
+
+@app.patch("/api/tasks/<int:tid>")
+@auth_required
+def update_task(tid):
+    d=request.get_json(silent=True) or {}; allowed={"status","priority","owner","effort","due_date","name","description"}; fields={k:d[k] for k in allowed if k in d}
+    if "status" in fields and fields["status"] not in STATUSES:return jsonify({"error":"Invalid status."}),400
+    c=db(); t=c.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+    if not t:c.close();return jsonify({"error":"Task not found."}),404
+    p=c.execute("SELECT owner_id FROM projects WHERE id=?",(t["project_id"],)).fetchone()
+    if not p:c.close();return jsonify({"error":"Forbidden."}),403
+    if any(k in fields for k in ("name","description","priority","owner","effort","due_date")) and not can_manage_project(t["project_id"]):
+        c.close(); return jsonify({"error":"Manager or owner permission required for task planning changes."}),403
+    if not fields:c.close();return jsonify(rowdict(t))
+    if "effort" in fields: fields["effort"]=max(0.1,float(fields["effort"]))
+    sets=", ".join(f"{k}=?" for k in fields); c.execute(f"UPDATE tasks SET {sets} WHERE id=?",(*fields.values(),tid)); c.commit(); pid=t["project_id"]; c.close()
+    add_activity(pid,"Task updated",f"{t['task_key']} changed: {', '.join(fields)}"); refresh_notifications(pid); return jsonify(project_state(pid))
+
+@app.post("/api/tasks")
+@auth_required
+def create_task():
+    d=request.get_json(silent=True) or {}; pid=int(d.get("project_id") or 0); p=project_owned(pid)
+    if not p:return jsonify({"error":"Project not found."}),404
+    err=require_manager(pid)
+    if err:return err
+    name=(d.get("name") or "").strip();
+    if not name:return jsonify({"error":"Task name required."}),400
+    c=db(); key=f"T{c.execute('SELECT COUNT(*) AS count FROM tasks WHERE project_id=?',(pid,)).fetchone()['count']+1}"; tid=c.execute("INSERT INTO tasks(project_id,task_key,name,description,priority,effort,risk_level,status,owner,due_date) VALUES(?,?,?,?,?,?,?,?,?,?)",(pid,key,name,d.get("description",""),d.get("priority","MEDIUM"),max(0.1,float(d.get("effort",1))),d.get("risk_level","MEDIUM"),"NOT STARTED",d.get("owner","Unassigned"),d.get("due_date"))).lastrowid; c.commit();c.close();add_activity(pid,"Task created",name);refresh_notifications(pid);return jsonify(project_state(pid))
+
+@app.delete("/api/tasks/<int:tid>")
+@auth_required
+def delete_task(tid):
+    c=db();t=c.execute("SELECT project_id,task_key FROM tasks WHERE id=?",(tid,)).fetchone();
+    if not t or not project_owned(t["project_id"]):c.close();return jsonify({"error":"Task not found."}),404
+    pid=t["project_id"]; c.close(); err=require_manager(pid)
+    if err:return err
+    c=db(); c.execute("DELETE FROM tasks WHERE id=?",(tid,)); c.commit(); c.close(); add_activity(pid,"Task deleted",t["task_key"]); refresh_notifications(pid); return jsonify(project_state(pid))
+
+@app.get("/api/dashboard/<int:pid>")
+@auth_required
+def dashboard(pid):
+    if not project_owned(pid):return jsonify({"error":"Project not found."}),404
+    refresh_notifications(pid); s=project_state(pid); c=db(); unread=c.execute("SELECT COUNT(*) AS count FROM notifications WHERE project_id=? AND read=0",(pid,)).fetchone()['count']; recent=[rowdict(x) for x in c.execute("SELECT * FROM activity WHERE project_id=? ORDER BY id DESC LIMIT 8",(pid,)).fetchall()]; c.close(); s.update({"unread_notifications":unread,"recent_activity":recent,"decision_summary":{"health":s["health"],"top_risk":s["risks"][0]["name"] if s["risks"] else None,"next_action":next((t["name"] for t in s["tasks"] if t["status"]!="COMPLETED"),None),"critical_path_at_risk":s["critical_path_duration"]>s["project"]["deadline_days"]}}); return jsonify(s)
+
+@app.get("/api/dependencies/<int:pid>")
+@auth_required
+def get_dependencies(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    return jsonify({"dependencies":s["dependencies"],"critical_path":s["critical_path"],"cycle":s["dependency_cycle"]})
+
+@app.post("/api/dependencies")
+@auth_required
+def add_dependency():
+    d=request.get_json(silent=True) or {};pid=int(d.get("project_id") or 0);p=project_owned(pid)
+    if not p:return jsonify({"error":"Project not found."}),404
+    err=require_manager(pid)
+    if err:return err
+    c=db(); a=c.execute("SELECT id,task_key FROM tasks WHERE id=? AND project_id=?",(d.get("from_task_id"),pid)).fetchone(); b=c.execute("SELECT id,task_key FROM tasks WHERE id=? AND project_id=?",(d.get("to_task_id"),pid)).fetchone()
+    if not a or not b or a["id"]==b["id"]:c.close();return jsonify({"error":"Invalid dependency."}),400
+    existing=[rowdict(x) for x in c.execute("SELECT d.from_task,d.to_task,a.task_key from_key,b.task_key to_key FROM dependencies d JOIN tasks a ON a.id=d.from_task JOIN tasks b ON b.id=d.to_task WHERE d.project_id=?",(pid,)).fetchall()]
+    test=[*existing,{"from_task":a["id"],"to_task":b["id"],"from_key":a["task_key"],"to_key":b["task_key"]}]
+    # Convert to keys and run cycle check.
+    tasks=[rowdict(x) for x in c.execute("SELECT * FROM tasks WHERE project_id=?",(pid,)).fetchall()]; deps=[{"from_task":x["from_key"],"to_task":x["to_key"]} for x in test]
+    if critical_path(tasks,deps)["has_cycle"]:c.close();return jsonify({"error":"Dependency would create a cycle."}),400
+    c.execute("INSERT INTO dependencies(project_id,from_task,to_task) VALUES(?,?,?)",(pid,a["id"],b["id"]));c.commit();c.close();add_activity(pid,"Dependency added",f"{a['task_key']} â†’ {b['task_key']}");return jsonify(project_state(pid))
+
+@app.delete("/api/dependencies/<int:did>")
+@auth_required
+def delete_dependency(did):
+    c=db();r=c.execute("SELECT project_id,from_task,to_task FROM dependencies WHERE id=?",(did,)).fetchone()
+    if not r or not project_owned(r["project_id"]):c.close();return jsonify({"error":"Dependency not found."}),404
+    c.close(); err=require_manager(r["project_id"])
+    if err:return err
+    c=db(); c.execute("DELETE FROM dependencies WHERE id=?",(did,));c.commit();c.close();add_activity(r["project_id"],"Dependency removed",f"Dependency #{did} removed");return jsonify(project_state(r["project_id"]))
+
+@app.get("/api/team/<int:pid>")
+@auth_required
+def team(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    return jsonify({"team":s["team"],"can_manage":can_manage_project(pid)})
+
+@app.post("/api/team")
+@auth_required
+def add_team_member():
+    d=request.get_json(silent=True) or {}; pid=int(d.get("project_id") or 0)
+    err=require_manager(pid)
+    if err:return err
+    name=(d.get("name") or "").strip()[:80]; role=(d.get("role") or "TEAM MEMBER").strip()[:60]; skills=(d.get("skills") or "General").strip()[:300]
+    if not name:return jsonify({"error":"Member name is required."}),400
+    availability=max(0,min(100,int(d.get("availability",80)))); workload=max(0,min(100,int(d.get("workload",0))))
+    daily_rate=max(0,float(d.get("daily_rate",os.getenv("NEXUS_DEFAULT_DAILY_RATE","2000"))))
+    user_id=d.get("user_id")
+    c=db(); cur=c.execute("INSERT INTO team_members(project_id,name,role,skills,availability,workload,daily_rate,user_id) VALUES(?,?,?,?,?,?,?,?)",(pid,name,role,skills,availability,workload,daily_rate,user_id if user_id else None)); c.commit(); c.close(); add_activity(pid,"Team member added",f"{name} joined as {role}"); return jsonify(project_state(pid))
+
+@app.post("/api/team/invite")
+@auth_required
+def invite_team_member():
+    d=request.get_json(silent=True) or {}; pid=int(d.get("project_id") or 0); err=require_manager(pid)
+    if err:return err
+    email=(d.get("email") or "").strip().lower(); role=(d.get("role") or "MEMBER").strip().upper()
+    if not email:return jsonify({"error":"Email is required."}),400
+    c=db(); u=c.execute("SELECT id,name,email,role,plan FROM users WHERE email=?",(email,)).fetchone()
+    if not u:c.close();return jsonify({"error":"No NEXUS-X account exists for that email yet. Ask the person to create a Free account first."}),404
+    try:
+        c.execute("INSERT INTO project_members(project_id,user_id,role,created_at) VALUES(?,?,?,?)",(pid,u["id"],role,now()))
+        # Keep a visible operational team member record linked to the user.
+        c.execute("INSERT INTO team_members(project_id,name,role,skills,availability,workload,daily_rate,user_id) VALUES(?,?,?,?,?,?,?,?)",(pid,u["name"],role,"General",80,0,float(os.getenv("NEXUS_DEFAULT_DAILY_RATE","2000")),u["id"]))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close();return jsonify({"error":"That user is already a member of this project."}),409
+    c.close(); add_activity(pid,"Team invitation accepted","%s added as %s"%(u["name"],role)); return jsonify(project_state(pid))
+
+@app.patch("/api/team/<int:mid>")
+@auth_required
+def update_team_member(mid):
+    c=db(); m=c.execute("SELECT * FROM team_members WHERE id=?",(mid,)).fetchone(); c.close()
+    if not m:return jsonify({"error":"Team member not found."}),404
+    err=require_manager(m["project_id"]);
+    if err:return err
+    d=request.get_json(silent=True) or {}; allowed={"name","role","skills","availability","workload","daily_rate","user_id"}; fields={k:d[k] for k in allowed if k in d}
+    if not fields:return jsonify(project_state(m["project_id"]))
+    if "name" in fields: fields["name"]=(str(fields["name"]).strip()[:80])
+    for k in ("availability","workload"):
+        if k in fields: fields[k]=max(0,min(100,int(fields[k])))
+    if "daily_rate" in fields: fields["daily_rate"]=max(0,float(fields["daily_rate"]))
+    sets=", ".join(f"{k}=?" for k in fields); c=db(); c.execute(f"UPDATE team_members SET {sets} WHERE id=?",(*fields.values(),mid)); c.commit(); c.close(); add_activity(m["project_id"],"Team member updated",m["name"]); refresh_notifications(m["project_id"]); return jsonify(project_state(m["project_id"]))
+
+@app.delete("/api/team/<int:mid>")
+@auth_required
+def delete_team_member(mid):
+    c=db(); m=c.execute("SELECT * FROM team_members WHERE id=?",(mid,)).fetchone();
+    if not m:c.close();return jsonify({"error":"Team member not found."}),404
+    pid=m["project_id"]; c.close(); err=require_manager(pid)
+    if err:return err
+    c=db(); c.execute("DELETE FROM team_members WHERE id=?",(mid,)); c.commit(); c.close(); add_activity(pid,"Team member removed",m["name"]); return jsonify(project_state(pid))
+
+@app.post("/api/team/recommend")
+@rate_limit(30,60)
+@auth_required
+def recommend_team_member():
+    d=request.get_json(silent=True) or {}; pid=int(d.get("project_id") or 0); tid=int(d.get("task_id") or 0)
+    if not project_owned(pid): return jsonify({"error":"Project not found."}),404
+    c=db(); task=c.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(tid,pid)).fetchone(); members=[rowdict(x) for x in c.execute("SELECT * FROM team_members WHERE project_id=?",(pid,)).fetchall()]; c.close()
+    if not task:return jsonify({"error":"Task not found."}),404
+    if not members:return jsonify({"error":"Add team members before requesting a recommendation."}),400
+    task_text=(str(task["name"])+" "+str(task["description"])).lower()
+    keywords=set(re.findall(r"[a-z0-9+#.-]{2,}",task_text))
+    ranked=[]
+    for m in members:
+        skill_text=(str(m.get("skills","")+" "+str(m.get("role",""))).lower())
+        skill_words=set(re.findall(r"[a-z0-9+#.-]{2,}",skill_text))
+        overlap=sorted(keywords & skill_words)
+        skill_score=min(60,20+len(overlap)*10) if overlap else 15
+        availability=max(0,min(100,float(m.get("availability") or 0)))
+        workload=max(0,min(100,float(m.get("workload") or 0)))
+        capacity_score=(100-workload)*0.25+availability*0.25
+        score=int(max(0,min(100,round(skill_score+capacity_score))))
+        effort=max(1,float(task["effort"] or 1))
+        workload_after=round(min(100,workload+effort/max(1,availability)*20),1)
+        reason=(f"Skill match: {', '.join(overlap[:6])}. " if overlap else "Limited direct skill overlap detected. ")+f"Availability is {availability:.0f}% and current workload is {workload:.0f}%."
+        ranked.append({"member_id":m["id"],"id":m["id"],"name":m["name"],"role":m["role"],"match_score":score,"workload_after":workload_after,"reason":reason,"matched_skills":overlap})
+    ranked.sort(key=lambda x:(x["match_score"],-x["workload_after"]),reverse=True)
+    mode="skills-capacity evidence"
+    if os.getenv("OPENAI_API_KEY") and OpenAI:
+        try:
+            client=OpenAI(); prompt=f"""You are NEXUS-X Team Planner. Rank candidates using only the supplied facts. Return ONLY JSON {{"ranked":[{{"id":1,"match_score":90,"reason":"..."}}]}}. Task: {json.dumps(rowdict(task),default=str)} Candidates: {json.dumps(ranked,default=str)}"""
+            rr=client.responses.create(model=os.getenv("NEXUS_MODEL","gpt-5"),input=prompt); parsed=_parse_llm_json(rr.output_text)
+            if parsed and isinstance(parsed.get("ranked"),list):
+                by_id={x["id"]:x for x in ranked}; merged=[]
+                for item in parsed["ranked"]:
+                    base=by_id.get(int(item.get("id",0)))
+                    if base:
+                        base={**base,"match_score":int(max(0,min(100,int(item.get("match_score",base["match_score"]))))),"reason":str(item.get("reason") or base["reason"])[:500]}; merged.append(base)
+                if merged:
+                    ranked=merged+[x for x in ranked if x["id"] not in {m["id"] for m in merged}]; mode="llm+evidence"
+        except Exception as exc: app.logger.warning("Team recommendation LLM unavailable: %s",exc)
+    best=ranked[0]; add_activity(pid,"AI team recommendation",f"Recommended {best['name']} for {task['task_key']} with {best['match_score']}% match.")
+    return jsonify({"task":rowdict(task),"recommended_member":best,"alternatives":ranked[1:5],"mode":mode,"explanation":"Recommendation uses task/skill overlap, availability and workload. When OpenAI is configured it can refine ranking using only these supplied facts."})
+
+
+@app.get("/api/team/users")
+@auth_required
+def team_users():
+    c=db(); rows=[rowdict(x) for x in c.execute("SELECT id,name,email,role,plan FROM users ORDER BY name").fetchall()]; c.close(); return jsonify({"users":rows})
+
+@app.get("/api/risks/<int:pid>")
+@auth_required
+def risks(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    return jsonify({"risks":s["risks"]})
+
+@app.post("/api/what-if")
+@auth_required
+def what_if():
+    d=request.get_json(silent=True) or {}; pid=int(d.get('project_id') or 0); s=project_state(pid) if pid else None
+    if not s:return jsonify({'error':'Project not found.'}),404
+    team=max(1,int(d.get('team',s['project']['team_size'])))
+    deadline=max(1,int(d.get('deadline',s['project']['deadline_days'])))
+    budget=float(d.get('budget',s['project']['budget']))
+    scope=max(.5,min(2,float(d.get('scope_factor',1))))
+    scaled=[{**t,'effort':float(t['effort'])*scope} for t in s['tasks']]
+    cp=critical_path(scaled,s['dependencies'])
+    capacity=team*deadline*.75
+    effort=sum(float(t['effort']) for t in scaled)
+    utilization=effort/max(1,capacity)*100
+    scenario_project={**s['project'],'team_size':team,'deadline_days':deadline,'budget':budget}
+    existing=s['team']
+    avg_rate=statistics.mean([float(m.get('daily_rate') or os.getenv('NEXUS_DEFAULT_DAILY_RATE','2000')) for m in existing]) if existing else float(os.getenv('NEXUS_DEFAULT_DAILY_RATE','2000'))
+    scenario_team=[]
+    for i in range(team):
+        base=existing[i] if i < len(existing) else {'name':f'Scenario Member {i+1}','role':'TEAM MEMBER','skills':'General','availability':80,'daily_rate':avg_rate}
+        scenario_team.append({**base,'workload':min(100,round(utilization/max(1,team))), 'daily_rate':float(base.get('daily_rate') or avg_rate)})
+    costs=project_cost_estimate(scenario_project,scaled,scenario_team)
+    budget_feasible=(budget<=0 or costs['total']<=budget)
+    risks=live_risk_engine(scenario_project,scaled,s['dependencies'],scenario_team,cp)
+    if not budget_feasible:
+        risks.append(_risk('Budget Overrun','HIGH' if costs['total']<=budget*1.25 else 'CRITICAL',9 if costs['total']>budget*1.5 else 8, f'Estimated project cost is â‚¹{costs["total"]:,.0f} against a â‚¹{budget:,.0f} scenario budget.',80,85,'Increase budget, reduce scope, or rebalance lower-cost capacity.'))
+    health=health_engine(scenario_project,scaled,risks,scenario_team,cp)
+    current=s['health']
+    delta=health['health']-current
+    feasible=not cp['has_cycle'] and cp['duration']<=deadline and capacity>=effort and budget_feasible
+    verdict='NOT FEASIBLE' if not feasible else 'IMPROVES' if delta>3 else 'RISKIER' if delta<-3 else 'STABLE'
+    result={'team':team,'deadline':deadline,'budget':budget,'scope_factor':scope,'capacity':round(capacity,1),'baseline_capacity':s['capacity'],'estimated_effort':round(effort,1),'risk_score':risks[0]['score'] if risks else 1,'risks':risks[:5],'deadline_feasible':feasible,'team_utilization':round(utilization),'health':health['health'],'current_health':current,'health_delta':delta,'verdict':verdict,'critical_path':cp['path'],'critical_path_duration':cp['duration'],'critical_path_slack':round(max(0,deadline-cp['duration']),2),'components':health['components'],'estimated_cost':costs['total'],'labor_cost':costs['labor'],'infrastructure_cost':costs['infrastructure'],'ai_cost':costs['ai'],'task_costs':costs.get('task_costs',[]),'budget_feasible':budget_feasible,'explanation':health['explanation'],'recommendation':('Increase budget or reduce scope.' if not budget_feasible else 'Add capacity or reduce scope.') if not feasible else ('This scenario materially improves project health.' if delta>3 else 'Protect the critical path and monitor the changed assumptions.')}
+    c=db();c.execute('INSERT INTO scenarios(project_id,team_size,deadline_days,budget,scope_factor,result,created_at) VALUES(?,?,?,?,?,?,?)',(pid,team,deadline,budget,scope,json.dumps(result),now()));c.commit();c.close();add_activity(pid,'What-If scenario',f'Compared team {s["project"]["team_size"]}â†’{team}, deadline {s["project"]["deadline_days"]}â†’{deadline}, scope Ã—{scope}.');refresh_notifications(pid);return jsonify(result)
+
+@app.get('/api/scenarios/<int:pid>')
+@auth_required
+def scenarios(pid):
+    if not project_owned(pid): return jsonify({'error':'Project not found.'}),404
+    c=db(); rows=[rowdict(x) for x in c.execute('SELECT * FROM scenarios WHERE project_id=? ORDER BY id DESC LIMIT 20',(pid,)).fetchall()];c.close()
+    for r in rows:
+        try:r['result']=json.loads(r['result'])
+        except Exception:pass
+    return jsonify({'scenarios':rows})
+
+@app.get('/api/dependencies/<int:pid>/impact')
+@auth_required
+def dependency_impact(pid):
+    s=project_state(pid)
+    if not s:return jsonify({'error':'Project not found.'}),404
+    by={t['task_key']:t for t in s['tasks']}
+    impacts=[]
+    for d in s['dependencies']:
+        downstream=by.get(d['to_task']); upstream=by.get(d['from_task'])
+        if not downstream or not upstream: continue
+        impacts.append({'from':d['from_task'],'to':d['to_task'],'upstream_status':upstream['status'],'downstream_status':downstream['status'],'downstream_effort':downstream['effort'],'on_critical_path':d['from_task'] in s['critical_path'] or d['to_task'] in s['critical_path'],'impact':'HIGH' if d['to_task'] in s['critical_path'] else 'MEDIUM'})
+    return jsonify({'impact':impacts,'cycle':s['dependency_cycle'],'critical_path':s['critical_path']})
+
+def local_copilot(message, s=None):
+    """
+    Project-aware deterministic Copilot fallback.
+
+    Important:
+    - Different questions should produce different answers.
+    - Intent detection is ordered from specific -> general.
+    - This fallback remains useful even without OPENAI_API_KEY.
+    """
+    m = (message or "").strip().lower()
+
+
+        # ---------------------------------------------------------
+    # GENERAL CHAT / LEARNING INTENTS
+    # ---------------------------------------------------------
+    if m in {"hi", "hello", "hey", "hii", "helo", "good morning", "good afternoon", "good evening"}:
+        return (
+            "**Answer:** Hello! I'm **NEXUS-X Copilot**. "
+            "I can help with projects, tasks, risks, schedules, teams, "
+            "budgets, architecture, reports, technical questions and viva preparation."
+        )
+
+    if (
+        "what can you do" in m
+        or "what do you do" in m
+        or m == "help"
+        or "how can you help" in m
+    ):
+        return (
+            "**Answer:** I can help you analyze your project, prioritize tasks, "
+            "identify risks, check deadlines and critical paths, analyze team "
+            "capacity, explain architecture and technology, run what-if scenarios, "
+            "generate reports and prepare you for viva or interviews."
+        )
+
+    if "viva" in m or "interview" in m or "exam" in m:
+        return (
+            "**Answer:** I can help you prepare for your viva, exam or interview. "
+            "I can explain the project, generate technical questions and answers, "
+            "and quiz you one question at a time."
+        )
+
+    if "what is postgresql" in m or "what is postgres" in m or m in {"postgresql", "postgres"}:
+        return (
+            "**Answer:** PostgreSQL is an open-source relational database "
+            "management system. It stores structured data in tables and supports "
+            "SQL, relationships, transactions, indexes and advanced database features."
+        )
+
+    if "what is an api" in m or "what is api" in m or "what's an api" in m or m == "api":
+        return (
+            "**Answer:** An API, or Application Programming Interface, allows "
+            "different software components to communicate with each other. "
+            "For example, a frontend can call a backend API to retrieve or update data."
+        )
+
+    if "what is python" in m:
+        return (
+            "**Answer:** Python is a high-level programming language widely used "
+            "for web development, automation, data analysis, AI and machine learning."
+        )
+
+    if "what is flask" in m:
+        return (
+            "**Answer:** Flask is a lightweight Python web framework used to build "
+            "web applications and backend APIs."
+        )
+
+    if "what is sqlalchemy" in m:
+        return (
+            "**Answer:** SQLAlchemy is a Python database toolkit that provides "
+            "SQL capabilities and database connectivity through Python."
+        )
+
+    if "what is csrf" in m:
+        return (
+            "**Answer:** CSRF stands for Cross-Site Request Forgery. It is a web "
+            "security attack where an unwanted request is made using an authenticated "
+            "user's session. CSRF tokens help prevent it."
+        )
+
+    if "what is authentication" in m:
+        return (
+            "**Answer:** Authentication verifies a user's identity. Authorization "
+            "then determines what that authenticated user is allowed to access or change."
+        )
+
+    # ---------------------------------------------------------
+    # PROJECT-SPECIFIC LEARNING INTENTS
+    # ---------------------------------------------------------
+    if s:
+        if "architecture" in m or "system design" in m:
+            return (
+                f"**Answer:** The **architecture** of **{s.get('project_name', 'this project')}** "
+                "describes how its major components communicate.\n\n"
+                "**WHY:** Architecture separates responsibilities such as the user "
+                "interface, backend/API, business logic, database and external services.\n\n"
+                "**ACTION:** Review the data flow between these components and verify "
+                "that authentication, authorization and database boundaries are clear."
+            )
+
+        if "viva" in m or "interview" in m or "exam" in m:
+            return (
+                f"**Answer:** Let's prepare you for your **viva** on "
+                f"**{s.get('project_name', 'this project')}**.\n\n"
+                "**Start with these questions:**\n"
+                "1. What problem does this project solve?\n"
+                "2. What are the main modules?\n"
+                "3. Why did you choose the technology stack?\n"
+                "4. How does the database work?\n"
+                "5. How are authentication and authorization handled?\n"
+                "6. What are the major risks?\n"
+                "7. How would you test and deploy the system?\n\n"
+                "**ACTION:** I can ask these one at a time and evaluate your answers."
+            )
+
+    if not s:
+        if "nexus" in m:
+            return (
+                "**Answer:** NEXUS-X is a work-intelligence platform that turns "
+                "project information into execution plans, risks and decisions.\n\n"
+                "**ACTION:** Add a project for project-aware answers."
+            )
+
+        if any(k in m for k in ["python", "javascript", "code", "api", "sql"]):
+            return (
+                "**Answer:** I can help with coding questions.\n\n"
+                "**ACTION:** Provide the relevant code, error or technical goal."
+            )
+
+        return (
+            "**Answer:** I can answer general questions when the real AI model "
+            "is configured.\n\n"
+            "**ACTION:** Add OPENAI_API_KEY for full general-purpose Copilot capability."
+        )
+
+    # ---------------------------------------------------------
+    # 1. FIRST / NEXT / PRIORITY TASK
+    # Check this BEFORE "why" or "risk".
+    # ---------------------------------------------------------
+    first_question = any(k in m for k in [
+        "which task",
+        "what task",
+        "first task",
+        "start with",
+        "work on first",
+        "do first",
+        "next task",
+        "what should we do first",
+        "what should the team work on",
+        "priority task",
+        "highest priority task",
+        "most important task"
+    ])
+
+    if first_question:
+        first = (
+            next(
+                (
+                    t for t in s["tasks"]
+                    if t["status"] != "COMPLETED"
+                    and t["task_key"] in s["critical_path"]
+                ),
+                None,
+            )
+            or next(
+                (
+                    t for t in s["tasks"]
+                    if t["status"] != "COMPLETED"
+                ),
+                None,
+            )
+        )
+
+        if first:
+            downstream = [
+                d["to_task"]
+                for d in s.get("dependencies", [])
+                if d.get("from_task") == first["task_key"]
+            ]
+
+            dependency_text = (
+                ", ".join(downstream)
+                if downstream
+                else "no immediate downstream tasks"
+            )
+
+            return (
+                f"**Answer:** Start with **{first['task_key']} – {first['name']}**.\n\n"
+                f"**WHY:** This is the highest-priority incomplete task on "
+                f"the current critical path, so delaying it can affect downstream work.\n\n"
+                f"**EVIDENCE:** Effort is **{first.get('effort', 0)} person-days**, "
+                f"priority is **{first.get('priority', 'N/A')}**, "
+                f"risk level is **{first.get('risk_level', 'N/A')}**, "
+                f"and downstream dependencies include **{dependency_text}**.\n\n"
+                f"**IMPACT:** A delay to this task can reduce the remaining "
+                f"recovery time for the project because the current critical "
+                f"path is **{s['critical_path_duration']} days** against a "
+                f"**{s['project']['deadline_days']}-day deadline**.\n\n"
+                f"**ACTION:** Protect this task from blockers, complete its "
+                f"dependencies and update its status as soon as work progresses."
+            )
+
+    # ---------------------------------------------------------
+    # 2. TEAM MEMBER / ASSIGNMENT
+    # ---------------------------------------------------------
+    assignment_question = any(k in m for k in [
+        "who should",
+        "who can",
+        "best person",
+        "best member",
+        "assign",
+        "team member",
+        "who should handle",
+        "who should work"
+    ])
+
+    if assignment_question:
+        available = [
+            member for member in s.get("team", [])
+            if member.get("status", "ACTIVE") != "INACTIVE"
+        ]
+
+        if available:
+            # Prefer the member with the lowest current workload.
+            recommended = min(
+                available,
+                key=lambda x: float(x.get("workload", 0) or 0)
+            )
+
+            return (
+                f"**Answer:** Consider **{recommended.get('name', 'the available team member')}** "
+                f"for the next assignment.\n\n"
+                f"**WHY:** The current project data shows this member has "
+                f"the lowest available workload among the active team members.\n\n"
+                f"**EVIDENCE:** Current workload is approximately "
+                f"**{recommended.get('workload', 0)}%**.\n\n"
+                f"**IMPACT:** Assigning work to a lower-utilization member can "
+                f"reduce capacity pressure on the project.\n\n"
+                f"**ACTION:** Review the member's skills and availability before "
+                f"confirming the assignment."
+            )
+
+        return (
+            "**Answer:** No active team member is currently available in the "
+            "project data.\n\n"
+            "**ACTION:** Add or activate a team member before assigning work."
+        )
+
+    # ---------------------------------------------------------
+    # 3. DEADLINE / FEASIBILITY
+    # ---------------------------------------------------------
+    deadline_question = any(k in m for k in [
+        "deadline",
+        "feasible",
+        "feasibility",
+        "on time",
+        "finish on time",
+        "complete on time",
+        "schedule realistic",
+        "can we finish",
+        "can the project finish"
+    ])
+
+    if deadline_question:
+        status = s["health_status"]
+
+        return (
+            f"**Answer:** The project is currently **{status}** — health is "
+            f"**{s['health']}%**.\n\n"
+            f"**WHY:** The calculated critical path is **{s['critical_path_duration']} days** "
+            f"while the deadline is **{s['project']['deadline_days']} days**.\n\n"
+            f"**EVIDENCE:** Current progress is **{s['progress']}%**, "
+            f"blocked tasks are **{s['blocked']}**, and the critical path is "
+            f"**{' → '.join(s['critical_path']) or 'not available'}**.\n\n"
+            f"**IMPACT:** If critical-path work slips, downstream tasks have "
+            f"less recovery time before the deadline.\n\n"
+            f"**ACTION:** Protect critical-path tasks and reduce scope, add "
+            f"capacity, or extend the deadline if the schedule remains infeasible."
+        )
+
+    # ---------------------------------------------------------
+    # 4. CRITICAL PATH
+    # ---------------------------------------------------------
+    if "critical path" in m or "critical-path" in m:
+        return (
+            f"**Answer:** The current critical path is "
+            f"**{' → '.join(s['critical_path']) or 'not available'}**.\n\n"
+            f"**WHY:** These tasks have the greatest scheduling influence "
+            f"under the current dependency graph.\n\n"
+            f"**EVIDENCE:** Calculated duration is "
+            f"**{s['critical_path_duration']} days** versus a "
+            f"**{s['project']['deadline_days']}-day deadline**.\n\n"
+            f"**IMPACT:** Delay to a critical-path task can delay downstream work.\n\n"
+            f"**ACTION:** Protect these tasks and resolve blockers immediately."
+        )
+
+    # ---------------------------------------------------------
+    # 5. BLOCKERS
+    # ---------------------------------------------------------
+    if any(k in m for k in [
+        "blocker",
+        "blocked",
+        "blocking",
+        "what is blocking",
+        "what's blocking"
+    ]):
+        blocked_tasks = [
+            t for t in s["tasks"]
+            if t.get("status") in ("BLOCKED", "BLOCKER")
+        ]
+
+        if blocked_tasks:
+            names = ", ".join(
+                f"{t['task_key']} – {t['name']}"
+                for t in blocked_tasks[:8]
+            )
+
+            return (
+                f"**Answer:** There are **{len(blocked_tasks)} blocked tasks**.\n\n"
+                f"**WHY:** Blocked tasks can interrupt downstream execution.\n\n"
+                f"**EVIDENCE:** {names}\n\n"
+                f"**IMPACT:** Blocked work may increase schedule and dependency risk.\n\n"
+                f"**ACTION:** Resolve the blocker with the highest critical-path impact first."
+            )
+
+        return (
+            "**Answer:** There are currently **0 blocked tasks**.\n\n"
+            "**WHY:** No task is currently marked as blocked in the project data.\n\n"
+            "**ACTION:** Continue monitoring dependencies and critical-path tasks."
+        )
+
+    # ---------------------------------------------------------
+    # 6. BUDGET / COST
+    # ---------------------------------------------------------
+    if any(k in m for k in [
+        "budget",
+        "cost",
+        "expensive",
+        "money",
+        "financial"
+    ]):
+        budget = s["project"].get("budget", 0) or 0
+        cost = s.get("cost_estimate", 0) or 0
+
+        if budget:
+            remaining = budget - cost
+            feasibility = "within budget" if remaining >= 0 else "over budget"
+
+            return (
+                f"**Answer:** The current project is **{feasibility}**.\n\n"
+                f"**WHY:** Estimated project cost is **₹{cost:,.0f}** "
+                f"against a budget of **₹{budget:,.0f}**.\n\n"
+                f"**EVIDENCE:** Remaining budget is approximately "
+                f"**₹{remaining:,.0f}**.\n\n"
+                f"**IMPACT:** Cost pressure can limit the ability to add capacity "
+                f"or absorb schedule changes.\n\n"
+                f"**ACTION:** Review high-cost tasks and infrastructure/API costs "
+                f"before increasing project scope."
+            )
+
+        return (
+            "**Answer:** No project budget is currently configured.\n\n"
+            "**ACTION:** Set a project budget to enable budget-aware decisions."
+        )
+
+    # ---------------------------------------------------------
+    # 7. RISK / WHY IS PROJECT AT RISK
+    # ---------------------------------------------------------
+    if any(k in m for k in [
+        "risk",
+        "risks",
+        "at risk",
+        "danger",
+        "problem",
+        "concern"
+    ]):
+        high = [
+            r for r in s["risks"]
+            if r["severity"] in ("HIGH", "CRITICAL")
+        ]
+
+        high_names = ", ".join(
+            f"{r['name']} ({r['score']}/10)"
+            for r in high
+        ) or "none"
+
+        return (
+            f"**Answer:** The project is **{s['health_status']}** — health is "
+            f"**{s['health']}%**.\n\n"
+            f"**WHY:** { ' '.join(s['explanation']) }\n\n"
+            f"**EVIDENCE:** High/critical risks: **{high_names}**; "
+            f"critical path: **{s['critical_path_duration']} days**; "
+            f"deadline: **{s['project']['deadline_days']} days**; "
+            f"blocked tasks: **{s['blocked']}**.\n\n"
+            f"**IMPACT:** High-risk work can reduce schedule recovery time "
+            f"and increase project uncertainty.\n\n"
+            f"**ACTION:** Address the highest-scoring risk and protect "
+            f"critical-path work."
+        )
+
+    # ---------------------------------------------------------
+    # 8. PROGRESS / HEALTH
+    # ---------------------------------------------------------
+    if any(k in m for k in [
+        "health",
+        "progress",
+        "status",
+        "how is the project"
+    ]):
+        return (
+            f"**Answer:** Project health is **{s['health']}%** "
+            f"({s['health_status']}).\n\n"
+            f"**WHY:** Health is calculated from project progress, schedule, "
+            f"risks, blockers, dependencies and workload.\n\n"
+            f"**EVIDENCE:** Progress **{s['progress']}%**, "
+            f"critical path **{s['critical_path_duration']} days**, "
+            f"deadline **{s['project']['deadline_days']} days**, "
+            f"blocked tasks **{s['blocked']}**.\n\n"
+            f"**ACTION:** Focus on the highest-impact incomplete critical-path work."
+        )
+
+    # ---------------------------------------------------------
+    # 9. GENERAL PROJECT QUESTION
+    # ---------------------------------------------------------
+    return (
+        f"**Answer:** I understand this as a project question about "
+        f"**{s['project'].get('name', 'the current project')}**.\n\n"
+        f"**WHY:** The current project has **{len(s['tasks'])} tasks**, "
+        f"**{len(s['risks'])} risks**, and **{len(s['dependencies'])} dependencies**.\n\n"
+        f"**EVIDENCE:** Health is **{s['health']}%**, progress is "
+        f"**{s['progress']}%**, and the critical path is "
+        f"**{' → '.join(s['critical_path']) or 'not available'}**.\n\n"
+        f"**ACTION:** Ask about the first task, critical path, deadline, "
+        f"risks, blockers, budget, team assignment or project health."
+    )
+
+
+@app.post("/api/chat")
+@rate_limit(30,60)
+@auth_required
+def chat():
+    d=request.get_json(silent=True) or {};msg=(d.get("message") or "").strip();pid=int(d.get("project_id") or 0)
+    if not msg:return jsonify({"error":"Message is required."}),400
+    s=project_state(pid) if pid else None
+    if pid and not s:return jsonify({"error":"Project not found."}),404
+    context={"project":s["project"],"health":s["health"],"health_status":s["health_status"],"progress":s["progress"],"tasks":s["tasks"],"risks":s["risks"],"team":s["team"],"dependencies":s["dependencies"],"critical_path":s["critical_path"],"critical_path_duration":s["critical_path_duration"],"cost_estimate":s.get("cost_estimate"),"budget":s["project"].get("budget",0)} if s else None
+    answer=None;mode="local"
+    if os.getenv("OPENAI_API_KEY") and OpenAI:
+        try:
+            client=OpenAI(); prompt=f"""You are NEXUS-X Copilot. Answer the user's actual question directly. You can answer general questions, coding, business, learning and project questions. If project context is supplied, use it rather than inventing facts. For project decisions use WHY, EVIDENCE, IMPACT, ACTION when useful. Be concise and practical.\nPROJECT CONTEXT: {json.dumps(context,default=str)}\nUSER: {msg}"""
+            r=client.responses.create(model=os.getenv("NEXUS_MODEL","gpt-5"),input=prompt);answer=r.output_text;mode="llm"
+        except Exception as exc: app.logger.warning("LLM unavailable: %s",exc)
+    if not answer: answer=local_copilot(msg,s)
+    if s: add_activity(pid,"Copilot used",msg[:180])
+    return jsonify({"answer":answer,"mode":mode,"project_id":pid or None})
+
+@app.get("/api/notifications/<int:pid>")
+@auth_required
+def notifications(pid):
+    if not project_owned(pid):return jsonify({"error":"Project not found."}),404
+    refresh_notifications(pid); c=db(); rows=[rowdict(x) for x in c.execute("SELECT * FROM notifications WHERE project_id=? ORDER BY id DESC LIMIT 30",(pid,)).fetchall()]; unread=sum(1 for r in rows if not r["read"]); c.close(); return jsonify({"notifications":rows,"unread":unread})
+
+@app.patch("/api/notifications/<int:nid>/read")
+@auth_required
+def mark_notification_read(nid):
+    c=db(); n=c.execute("SELECT project_id FROM notifications WHERE id=?",(nid,)).fetchone(); c.close()
+    if not n or not project_owned(n["project_id"]):return jsonify({"error":"Notification not found."}),404
+    c=db(); c.execute("UPDATE notifications SET read=1 WHERE id=?",(nid,)); c.commit(); c.close(); return jsonify({"ok":True})
+
+@app.post("/api/notifications/<int:pid>/read-all")
+@auth_required
+def mark_notifications_read(pid):
+    if not project_owned(pid):return jsonify({"error":"Project not found."}),404
+    c=db(); c.execute("UPDATE notifications SET read=1 WHERE project_id=?",(pid,)); c.commit(); c.close(); return jsonify({"ok":True})
+
+@app.get("/api/activity/<int:pid>")
+@auth_required
+def activity(pid):
+    if not project_owned(pid):return jsonify({"error":"Project not found."}),404
+    c=db();rows=[rowdict(x) for x in c.execute("SELECT * FROM activity WHERE project_id=? ORDER BY id DESC LIMIT 30",(pid,)).fetchall()];c.close();return jsonify({"activity":rows})
+
+@app.get("/api/analytics/<int:pid>")
+@auth_required
+def analytics(pid):
+    if not project_owned(pid):return jsonify({"error":"Project not found."}),404
+    s=project_state(pid); c=db(); rows=[rowdict(x) for x in c.execute("SELECT * FROM analytics_snapshots WHERE project_id=? ORDER BY id DESC LIMIT 60",(pid,)).fetchall()]; c.close()
+    return jsonify({"snapshots":list(reversed(rows)),"current":{"health":s["health"],"progress":s["progress"],"risk_score":s["risk_average"],"workload":s["utilization"],"critical_path_days":s["critical_path_duration"]}})
+
+
+@app.get("/api/export/tasks.csv/<int:pid>")
+@auth_required
+def export_csv(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    buf=io.StringIO();w=csv.writer(buf);w.writerow(["ID","Name","Priority","Effort","Risk","Status","Owner","Due"])
+    for t in s["tasks"]:w.writerow([t["task_key"],t["name"],t["priority"],t["effort"],t["risk_level"],t["status"],t["owner"],t["due_date"] or ""])
+    return send_file(io.BytesIO(buf.getvalue().encode()),as_attachment=True,download_name="nexus-tasks.csv",mimetype="text/csv")
+
+@app.get("/api/export/report.pdf/<int:pid>")
+@auth_required
+def export_pdf(pid):
+    s=project_state(pid)
+    if not s:return jsonify({"error":"Project not found."}),404
+    if canvas is None:return jsonify({"error":"PDF dependency unavailable."}),500
+    buf=io.BytesIO();c=canvas.Canvas(buf,pagesize=A4);y=800;c.setFont("Helvetica-Bold",18);c.drawString(40,y,"NEXUS-X Project Report");y-=28;c.setFont("Helvetica",10)
+    lines=[f"Project: {s['project']['name']}",f"Health: {s['health']}% ({s['health_status']}) | Progress: {s['progress']}%",f"Deadline: {s['project']['deadline_days']} days | Critical path: {s['critical_path_duration']} days",f"Critical path: {' -> '.join(s['critical_path'])}","","HEALTH WHY"]+s["explanation"]+["","TASKS"]+[f"{t['task_key']} {t['name']} â€” {t['status']} â€” {t['owner']}" for t in s["tasks"]]+["","RISKS"]+[f"{r['name']} â€” {r['severity']} {r['score']}/10 â€” {r['mitigation']}" for r in s["risks"]]
+    for line in lines:
+        if y<50:c.showPage();y=800;c.setFont("Helvetica",10)
+        c.drawString(40,y,str(line)[:110]);y-=16
+    c.save();buf.seek(0);return send_file(buf,as_attachment=True,download_name="nexus-project-report.pdf",mimetype="application/pdf")
+
+@app.post("/api/generate-project.zip")
+@rate_limit(20,60)
+@auth_required
+def generate_zip():
+    """Generate a complete NEXUS-X execution baseline, spec-driven tests and documentation."""
+    d = request.get_json(silent=True) or {}
+    prompt = (d.get("prompt") or "").strip()
+    pid = int(d.get("project_id") or 0)
+
+    # UNIVERSAL BUILDER FIX:
+    # When the Builder provides a NEW prompt, always generate from that prompt.
+    # Do not let the currently selected project override the user's new idea.
+    #
+    # project_id is used only when no new prompt was supplied.
+    if prompt:
+        a, _ = universal_analysis(prompt)
+    elif pid:
+        s = project_state(pid)
+        if not s:
+            return jsonify({"error": "Project not found."}), 404
+
+        prompt = s["project"]["description"]
+
+        a = {
+            "project_name": s["project"]["name"],
+            "objective": s["project"]["description"],
+            "deadline_days": s["project"]["deadline_days"],
+            "team_size": s["project"]["team_size"],
+            "scope": [t["name"] for t in s["tasks"]],
+            "requirements": [t["description"] for t in s["tasks"]],
+            "tasks": s["tasks"],
+            "dependencies": [[x["from_task"], x["to_task"]] for x in s["dependencies"]],
+            "risks": s["risks"],
+            "actions": s["explanation"],
+        }
+    else:
+        return jsonify({"error": "Tell NEXUS-X what to build."}), 400
+
+    slug = re.sub(r"[^a-z0-9]+", "-", str(a.get("project_name") or "nexus-project").lower()).strip("-")[:40] or "nexus-project"
+    features = list(dict.fromkeys(a.get("scope") or a.get("requirements") or []))
+    task_rows = a.get("tasks") or []
+    generated_at = now()
+    task_json = json.dumps(task_rows, indent=2)
+    dep_json = json.dumps(a.get("dependencies") or [], indent=2)
+    risk_json = json.dumps(a.get("risks") or [], indent=2)
+
+    files = {}
+    files["README.md"] = f"""# {a.get('project_name', 'NEXUS Generated Project')}
+
+Generated by NEXUS-X Project Builder 3.0 on {generated_at}.
+
+## Original request
+{prompt}
+
+## Included
+- Runnable Flask backend
+- Browser frontend
+- SQLite task persistence
+- Health and task APIs
+- Generated tests
+- Architecture and implementation documentation
+- Machine-readable PROJECT_SPEC.json
+
+## Run
+```powershell
+python -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+pip install -r requirements.txt
+python -m pytest -q
+python backend/app.py
+```
+Open http://127.0.0.1:5100
+
+## Generated scope
+{chr(10).join('- ' + str(x) for x in features) or '- Core application workflow'}
+
+NEXUS-X generates a functional, editable full-stack execution baseline from the analyzed project specification. Provider credentials and deployment configuration remain environment-specific.
+"""
+    files["requirements.txt"] = "Flask>=3.1,<4\npytest>=8,<10\n"
+    files[".env.example"] = "SECRET_KEY=change-me\nPORT=5100\n"
+    files["PROJECT_SPEC.json"] = json.dumps({
+        "generated_at": generated_at,
+        "request": prompt,
+        "project": a,
+        "universal_builder": {
+            "enabled": True,
+            "version": "UniversalProjectBuilder"
+        }
+    }, indent=2, default=str)
+    files["docs/ARCHITECTURE.md"] = f"""# Architecture
+
+Browser â†’ Flask API â†’ SQLite
+
+## Features
+{chr(10).join('- ' + str(x) for x in features) or '- Core workflow'}
+
+## Dependencies
+{dep_json}
+
+## Risks
+{risk_json}
+"""
+    plan = "\n".join(f"{i+1}. **{t.get('name','Task')}** â€” {t.get('description','')} â€” {t.get('effort',1)} person-days" for i, t in enumerate(task_rows))
+    actions = "\n".join("- " + str(x) for x in (a.get("actions") or ["Implement the critical path first."]))
+    files["docs/IMPLEMENTATION_PLAN.md"] = f"# Implementation Plan\n\n## Objective\n{a.get('objective', prompt)}\n\n## Tasks\n{plan}\n\n## Recommended next actions\n{actions}\n"
+    files["backend/__init__.py"] = ""
+
+    # Builder 2.0 ships the same full NEXUS-X runtime rather than a toy task scaffold.
+    current_backend = Path(__file__).read_text(encoding="utf-8")
+    current_index = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+    current_js = (FRONTEND_DIR / "app.js").read_text(encoding="utf-8")
+    current_css = (FRONTEND_DIR / "style.css").read_text(encoding="utf-8")
+    files["backend/__init__.py"] = ""
+    files["backend/app.py"] = current_backend
+
+    # Include the Universal Builder engine itself so the generated
+    # project remains reproducible and project-aware.
+    builder_path = BASE_DIR / "backend" / "project_builder.py"
+    if builder_path.exists():
+        files["backend/project_builder.py"] = builder_path.read_text(
+            encoding="utf-8"
+        )
+
+    files["frontend/index.html"] = current_index
+    files["frontend/app.js"] = current_js
+    files["frontend/style.css"] = current_css
+    files["requirements.txt"] = "Flask>=3.1,<4\nFlask-Cors>=6.0,<7\npython-dotenv>=1.0,<2\nopenai>=1.0,<2\npytest>=8,<10\nreportlab>=4,<5\n"
+    files[".env.example"] = "NEXUS_ENV=development\nNEXUS_SECRET_KEY=replace-with-a-random-32-character-secret\nNEXUS_CORS_ORIGINS=http://127.0.0.1:5000,http://localhost:5000\nNEXUS_DEFAULT_DAILY_RATE=2000\nNEXUS_ENABLE_DEMO=1\nOPENAI_API_KEY=\nNEXUS_MODEL=gpt-5\nNEXUS_SECURE_COOKIE=0\n"
+    files["docs/BUILDER_2.md"] = f"""# NEXUS-X Builder 2.0
+
+This generated project contains the complete NEXUS-X runtime, not a starter task-only scaffold.
+
+## Included intelligence
+- Authentication + RBAC + CSRF
+- AI Analyzer 2.0 with local fallback
+- OpenAI integration when configured
+- Critical Path + dependency graph
+- Health Engine
+- Live Risk Engine
+- What-If Simulator with budget/cost feasibility
+- Team recommendation engine
+- Notifications + activity history
+- Analytics snapshots
+- AI Copilot
+- PDF/CSV reporting
+- Responsive browser UI
+- Project Builder
+
+## Generated project specification
+See `PROJECT_SPEC.json` for the exact request, scope, tasks, dependencies and risks used to configure this build.
+
+## Run
+```powershell
+pip install -r requirements.txt
+python -m pytest -q
+python -m backend.app
+```
+
+The generated application is editable and intended as a complete execution baseline. Provider credentials and production deployment configuration remain environment-specific.
+"""
+    files["tests/test_app.py"] = """import json
+
+import backend.app as mod
+
+
+def test_home_and_health():
+    c=mod.app.test_client()
+    assert c.get('/') .status_code==200
+    r=c.get('/api/health')
+    assert r.status_code==200
+    assert r.get_json()['status']=='online'
+
+
+def test_analyzer_is_project_specific():
+    a=mod._heuristic_analysis('Build an employee attendance dashboard with login, leave management, database and cloud deployment.')
+    names=[t['name'] for t in a['tasks']]
+    assert 'Attendance Management' in names
+    assert 'Leave Management' in names
+    assert 'Authentication' in names
+
+
+def test_critical_path_is_calculated():
+    tasks=[{'task_key':'T1','effort':2},{'task_key':'T2','effort':3},{'task_key':'T3','effort':1}]
+    deps=[{'from_task':'T1','to_task':'T2'},{'from_task':'T2','to_task':'T3'}]
+    cp=mod.critical_path(tasks,deps)
+    assert cp['has_cycle'] is False
+    assert cp['duration']==6
+    assert cp['path']==['T1','T2','T3']
+
+
+def test_cycle_is_detected():
+    tasks=[{'task_key':'T1','effort':1},{'task_key':'T2','effort':1}]
+    deps=[{'from_task':'T1','to_task':'T2'},{'from_task':'T2','to_task':'T1'}]
+    assert mod.critical_path(tasks,deps)['has_cycle'] is True
+
+
+def test_health_engine_changes_for_blocker():
+    project={'deadline_days':10,'team_size':2}
+    tasks=[{'task_key':'T1','effort':5,'status':'BLOCKED'},{'task_key':'T2','effort':5,'status':'NOT STARTED'}]
+    cp=mod.critical_path(tasks,[{'from_task':'T1','to_task':'T2'}])
+    risks=mod.live_risk_engine(project,tasks,[{'from_task':'T1','to_task':'T2'}],[],cp)
+    h=mod.health_engine(project,tasks,risks,[],cp)
+    assert h['blocked']==1
+    assert h['health']<100
+
+
+def test_cost_model_is_real():
+    project={'infrastructure_cost':1000,'ai_cost':500}
+    tasks=[{'effort':2,'owner':'Riya'},{'effort':1,'owner':'Alex'}]
+    team=[{'name':'Riya','daily_rate':2400},{'name':'Alex','daily_rate':1800}]
+    c=mod.project_cost_estimate(project,tasks,team)
+    assert c['labor']==6600
+    assert c['total']==8100
+
+
+def test_project_spec_is_present():
+    data=json.load(open('PROJECT_SPEC.json',encoding='utf-8'))
+    assert data['request']
+    assert data['project']['tasks']
+    assert data['project']['dependencies'] is not None
+    assert data['project']['risks'] is not None
+"""
+    files["tests/test_project_spec.py"] = """import json
+
+
+def spec():
+    return json.load(open("PROJECT_SPEC.json",encoding="utf-8"))["project"]
+
+
+def test_spec_has_operational_model():
+    p=spec()
+    for key in ("project_name","objective","scope","requirements","tasks","dependencies","risks","actions"):
+        assert key in p
+    assert 1 <= len(p["tasks"]) <= 50
+
+
+def test_task_keys_are_unique_and_estimates_are_positive():
+    tasks=spec()["tasks"]
+    keys=[t.get("task_key") for t in tasks]
+    assert len(keys)==len(set(keys))
+    assert all(float(t.get("effort",0))>0 for t in tasks)
+
+
+def test_dependency_references_are_valid():
+    p=spec(); keys={t.get("task_key") for t in p["tasks"]}
+    for dep in p["dependencies"]:
+        assert len(dep)==2 and dep[0] in keys and dep[1] in keys and dep[0]!=dep[1]
+
+
+def test_risks_are_actionable():
+    for risk in spec()["risks"]:
+        assert risk.get("name") and risk.get("explanation") and risk.get("mitigation")
+        assert 1 <= int(risk.get("score",1)) <= 10
+
+
+def test_actions_and_scope_are_present():
+    p=spec()
+    assert p["scope"] and p["actions"]
+
+
+def test_project_estimates_are_reasonable():
+    p=spec()
+    assert int(p.get("deadline_days",1)) >= 1
+    assert int(p.get("team_size",1)) >= 1
+"""
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, v in files.items():
+            z.writestr(n, v)
+    mem.seek(0)
+    if pid:
+        add_activity(pid, "Project Builder", f"Generated runnable project scaffold with {len(files)} files.")
+    return send_file(mem, as_attachment=True, download_name=f"{slug}.zip", mimetype="application/zip")
+
+init_db()
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=True)
+
+
+
+
