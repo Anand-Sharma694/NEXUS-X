@@ -8,3 +8,11 @@ node_modules/
 *.log
 *.db
 *.sqlite
+
+# Local backups
+*.backup
+*.bak
+*.encoding-backup
+*.before-*
+debug_*.py
+repair_encoding.py
